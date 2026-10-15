@@ -130,3 +130,16 @@ supersedes an earlier one says so.
   Unknown fields are rejected, which keeps raw hidden reasoning out (rule 5). Signing is
   HMAC-SHA256 until provenance (Ed25519) lands. | The spec leaves these open. | Recorded in
   `cfa_shoc/baton.py` docstrings.
+- **2026-10-15 | Step 11: provenance implements the spec's source form only.** Proof type
+  `Ed25519Signature2020`, signature over JCS(credentialSubject), issuer `did:key` (Ed25519,
+  multicodec 0xed01, base58btc). Certificates are VC-shaped and verifiable with this library
+  (`verify_certificate`, `cfa-shoc verify`), not claimed verifiable by generic VC tooling; the
+  README says so. The W3C `eddsa-jcs-2022` Data Integrity form is not implemented (future
+  work), so the W3C cryptosuite document was not needed for this step. | Spec allows it if
+  stated. | `cryptography` is the optional extra `[provenance]` (also in `[dev]` for CI).
+- **2026-10-15 | Step 11: hashes inside certificates.** input/output/policy/commit hashes are
+  SHA-256 of `canonical_json` (sorted keys, compact). Merkle leaves use strict JCS, which
+  refuses floats, so a float in an extension is an error rather than a silent RFC 8785
+  mismatch. Leaf order is fixed by the spec; Mesh extension leaves follow in the order
+  expert_calls, symbolic_steps, adjudication, energy_trace. Fixed vectors for 1/3/5/7 leaves
+  live in `tests/test_provenance.py`, cross-checked against hand-built trees.
