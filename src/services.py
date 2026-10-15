@@ -4,6 +4,7 @@ CFA-SHOC Phase 1 Service Implementations
 Core services for capability management, preflight checks, policy decisions, etc.
 """
 
+import copy
 import hashlib
 import json
 from datetime import datetime, timedelta
@@ -13,7 +14,7 @@ from uuid import UUID, uuid4
 from .domain import (
     ActionProposal, CommitDecision, CommitRequest, DispatchRequest, DispatchLease,
     IdempotencyClass, ObservationEnvelope, PolicyDecision, PreflightResult,
-    ResultVerification, RiskClass, RollbackStrategy, SideEffectClass, ToolTransaction,
+    RawResult, ResultVerification, RiskClass, RollbackStrategy, SideEffectClass, ToolTransaction,
     TransactionEvent, TransactionState,
 )
 from .state_machine import TransactionStateMachine
@@ -23,48 +24,52 @@ class CapabilitySnapshotService:
     """
     Maintains current tool, connector, model, skill, quota, and policy state.
     Publishes immutable ledger snapshots with monotonically increasing sequence.
+
+    The ledger hash is content-addressed: it covers the capability content and the
+    content_version (bumped only when that content really changes). Wall-clock time and
+    the publication sequence are not part of the hash, so re-reading an unchanged ledger
+    at commit time yields the same hash.
     """
+
+    CONTENT_KEYS = ("tools", "connectors", "models", "skills", "quotas", "policies")
 
     def __init__(self):
         self.snapshot_sequence = 0
-        self.current_snapshot = {
-            "tools": {},
-            "connectors": {},
-            "models": {},
-            "skills": {},
-            "quotas": {},
-            "policies": {},
-        }
+        self.content_version = 0
+        self._last_content_digest: Optional[str] = None
+        self.current_snapshot = {key: {} for key in self.CONTENT_KEYS}
         self.snapshots = []
+        self.contracts: Dict[str, Dict[str, Any]] = {}
 
     def refresh_snapshot(self, principal_id: str, tenant_id: str) -> Dict[str, Any]:
         """
         Fetch current tool, connector, model, skill, quota, and policy state.
-        Validate snapshot signature and expiry.
 
         Returns:
-            Immutable snapshot with hash and sequence number
+            Snapshot (deep copy, so later registry edits cannot alter it) with a
+            content-addressed hash
         """
+        content = copy.deepcopy({key: self.current_snapshot[key] for key in self.CONTENT_KEYS})
+        digest = self._compute_hash(content)
+        if digest != self._last_content_digest:
+            self.content_version += 1
+            self._last_content_digest = digest
+
         snapshot = {
             "sequence": self.snapshot_sequence,
+            "content_version": self.content_version,
             "principal_id": principal_id,
             "tenant_id": tenant_id,
-            "tools": self.current_snapshot["tools"],
-            "connectors": self.current_snapshot["connectors"],
-            "models": self.current_snapshot["models"],
-            "skills": self.current_snapshot["skills"],
-            "quotas": self.current_snapshot["quotas"],
-            "policies": self.current_snapshot["policies"],
+            **content,
             "timestamp": datetime.utcnow().isoformat(),
         }
-
-        snapshot_hash = self._compute_hash(snapshot)
-        snapshot["hash"] = snapshot_hash
-
+        snapshot["hash"] = self._compute_hash(
+            {"content": content, "content_version": self.content_version}
+        )
         return snapshot
 
     def publish_snapshot(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
-        """Publish immutable ledger snapshot."""
+        """Publish immutable ledger snapshot (publication sequence is monotonic)."""
         self.snapshot_sequence += 1
         published = {
             **snapshot,
@@ -88,9 +93,32 @@ class CapabilitySnapshotService:
         tool = self.current_snapshot["tools"].get(tool_id)
         return tool.get("scopes", []) if tool else []
 
+    def get_tool(self, tool_id: str) -> Optional[Dict[str, Any]]:
+        """Get the registered tool record, or None."""
+        return self.current_snapshot["tools"].get(tool_id)
+
     def update_tool_state(self, tool_id: str, state: Dict[str, Any]) -> None:
         """Update tool state (internal operation)."""
         self.current_snapshot["tools"][tool_id] = state
+
+    def register_contract(self, episode_id: Any, contract: Dict[str, Any]) -> None:
+        """Register (or replace) the episode contract that commit-time checks re-read."""
+        self.contracts[str(episode_id)] = contract
+
+    def get_contract(
+        self, episode_id: Any, default: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Current contract for an episode; falls back to `default`, then {}."""
+        contract = self.contracts.get(str(episode_id))
+        if contract is None:
+            contract = default if default is not None else {}
+        return contract
+
+    @staticmethod
+    def contract_hash(contract: Dict[str, Any]) -> str:
+        """Content hash of a contract (any change to it changes the hash)."""
+        data_str = json.dumps(contract, sort_keys=True, default=str)
+        return hashlib.sha256(data_str.encode()).hexdigest()
 
     def _compute_hash(self, data: Dict[str, Any]) -> str:
         """Compute hash of snapshot for integrity."""
@@ -453,42 +481,138 @@ class ToolAdapter:
     """
     Boundary for tool invocation. Only interface allowed to call connectors.
     Handles credential isolation, protocol details, error normalization.
+
+    Each tool needs a registered handler: ``handler(request: DispatchRequest) -> dict``.
+    The handler returns a dict with:
+      - "status": "succeeded" | "accepted" (asynchronous) | "failed"
+      - "output": JSON-compatible result (optional)
+      - "external_operation_id": provider operation id (optional)
+      - "idempotency_key": the request's key echoed back (optional)
+    A tool with no handler fails closed: dispatch reports a connector error.
+    An optional status handler ``status_handler(tool_id, external_operation_id) -> dict``
+    answers status queries for asynchronous operations.
     """
 
     def __init__(self):
         self.adapters: Dict[str, Any] = {}
+        self.status_handlers: Dict[str, Any] = {}
+
+    def register(self, tool_id: str, handler: Any, status_handler: Any = None) -> None:
+        """Register the handler that performs a tool's operations."""
+        self.adapters[tool_id] = handler
+        if status_handler is not None:
+            self.status_handlers[tool_id] = status_handler
 
     def dispatch(self, request: DispatchRequest) -> Dict[str, Any]:
         """
         Dispatch request to tool/connector.
 
         Returns:
-            RawResult with transport status, headers, body
+            Normalized raw-result dict: transport_status ("ok", "async_accepted" or
+            "error"), status_code, headers, body (bytes), output, external_operation_id,
+            tool_id, connector_id, idempotency_key, received_at.
+            Raises TimeoutError when the handler times out (outcome unknown).
         """
-        # Simplified: simulate successful dispatch
-        return {
-            "transport_status": "200",
-            "status_code": 200,
+        base = {
             "headers": {},
-            "body": b'{"result": "success"}',
-            "external_operation_id": str(uuid4()),
+            "tool_id": request.tool_id,
+            "connector_id": request.connector_id,
             "received_at": datetime.utcnow().isoformat(),
+        }
+        handler = self.adapters.get(request.tool_id)
+        if handler is None:
+            return {
+                **base,
+                "transport_status": "error",
+                "status_code": None,
+                "body": None,
+                "output": {"error": f"No handler registered for tool {request.tool_id}"},
+                "external_operation_id": None,
+                "idempotency_key": None,
+            }
+        try:
+            response = handler(request)
+        except TimeoutError:
+            raise
+        except Exception as exc:  # connector failure, normalized
+            return {
+                **base,
+                "transport_status": "error",
+                "status_code": None,
+                "body": None,
+                "output": {"error": f"{type(exc).__name__}: {exc}"},
+                "external_operation_id": None,
+                "idempotency_key": None,
+            }
+
+        if not isinstance(response, dict):
+            response = {"status": "failed", "output": {"error": "Handler returned non-dict"}}
+        status = response.get("status", "succeeded")
+        transport_status = {"succeeded": "ok", "accepted": "async_accepted"}.get(status, "error")
+        output = response.get("output")
+        return {
+            **base,
+            "transport_status": transport_status,
+            "status_code": {"ok": 200, "async_accepted": 202}.get(transport_status, 500),
+            "body": json.dumps(output, sort_keys=True, default=str).encode(),
+            "output": output,
+            "external_operation_id": response.get("external_operation_id"),
+            "idempotency_key": response.get("idempotency_key"),
         }
 
     def preflight(self, request: DispatchRequest) -> Dict[str, Any]:
         """Check if dispatch would succeed."""
+        registered = request.tool_id in self.adapters
         return {
-            "can_dispatch": True,
-            "reason": None,
+            "can_dispatch": registered,
+            "reason": None if registered else f"No handler registered for tool {request.tool_id}",
         }
 
     def query_status(self, tool_id: str, external_operation_id: str) -> Dict[str, Any]:
-        """Query status of external operation."""
+        """
+        Query status of external operation.
+
+        Returns {"status": "succeeded" | "failed" | "unknown", "operation_id", "result"}.
+        Without a status handler the answer is "unknown" (never a guessed success).
+        """
+        status_handler = self.status_handlers.get(tool_id)
+        if status_handler is None:
+            return {"status": "unknown", "operation_id": external_operation_id, "result": None}
+        try:
+            answer = status_handler(tool_id, external_operation_id)
+        except Exception:
+            return {"status": "unknown", "operation_id": external_operation_id, "result": None}
+        status = answer.get("status", "unknown")
+        if status not in ("succeeded", "failed", "unknown"):
+            status = "unknown"
         return {
-            "status": "succeeded",
+            "status": status,
             "operation_id": external_operation_id,
-            "result": None,
+            "result": answer.get("result"),
         }
+
+
+def to_raw_result(raw: Any) -> Optional[RawResult]:
+    """The one place that turns ToolAdapter.dispatch output into a RawResult."""
+    if raw is None:
+        return None
+    if isinstance(raw, RawResult):
+        return raw
+    received_at = raw.get("received_at")
+    if isinstance(received_at, str):
+        received_at = datetime.fromisoformat(received_at)
+    return RawResult(
+        transport_status=str(raw.get("transport_status", "error")),
+        status_code=raw.get("status_code"),
+        headers=dict(raw.get("headers") or {}),
+        body=raw.get("body"),
+        external_operation_id=raw.get("external_operation_id"),
+        received_at=received_at or datetime.utcnow(),
+        output=raw.get("output"),
+        tool_id=raw.get("tool_id"),
+        connector_id=raw.get("connector_id"),
+        idempotency_key=raw.get("idempotency_key"),
+    )
 
 
 class ResultVerifier:
@@ -497,8 +621,9 @@ class ResultVerifier:
     Distinguishes authenticated results from evidence.
     """
 
-    def verify(self, raw_result: Dict[str, Any], tx: ToolTransaction) -> ResultVerification:
-        """Verify raw result from tool."""
+    def verify(self, raw_result: Any, tx: ToolTransaction) -> ResultVerification:
+        """Verify raw result (RawResult or adapter dict) from tool."""
+        raw_result = to_raw_result(raw_result)
         checks = {
             "signature_valid": True,  # Simplified
             "schema_valid": True,
