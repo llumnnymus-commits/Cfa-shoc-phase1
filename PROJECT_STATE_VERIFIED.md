@@ -17,6 +17,9 @@ commit gate, with a hash-chained audit log.
 | 2026-10-15 | Full suite after step 8 (151 tests), Python 3.11 / 3.12 / 3.13, DeprecationWarning as error | Claude Code session | 151 passed on each |
 | 2026-10-15 | Wheel build + fresh-venv install + `import cfa_shoc` | Claude Code session and CI | 0.1.0 |
 | 2026-10-15 | PyPI name `cfa-shoc` | pypi.org JSON API | 404 (free) |
+| 2026-10-15 | Full suite after step 12 (214 tests) on Python 3.11 / 3.12 / 3.13 | Claude Code session | 214 passed on each |
+| 2026-10-15 | `examples/demo_echo.py` | Claude Code session | DEMO OK (approved COMMITTED, denied REJECTED and never dispatched, lane C confirmed COMMITTED, 3 chains intact, certificate VALID) |
+| 2026-10-15 | Wheel + `[provenance]` in a fresh venv, `cfa-shoc --version` | Claude Code session | cfa-shoc 0.1.0 |
 
 ## CI runs
 | Step | Commit | Run | Result |
@@ -25,11 +28,22 @@ commit gate, with a hash-chained audit log.
 | 2-5 | 8470319..261a4a7 | runs 3-6 | red: remaining known defects, fixed in step 6 |
 | 6 tests | 0154b0e | https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38724320439 | **green**, 98 tests on 3.11/3.12/3.13 |
 | 7 packaging | 0c88bbd | https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38724620489 | **green**, tests x3 + package job (wheel, fresh venv, 0.1.0) |
-| 8 real checks | f7368f4 | https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38725147586 | pending at time of writing |
+| 8 real checks | f7368f4 | https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38725147586 | **green** |
+| 9 audit + reconcile | e4b0f7e | https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38725647866 | **green** |
+| 10 baton | bcdeb91 | https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38725981928 | **green** |
+| 11 provenance | 4be475c | https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38726301961 | see next update |
+| 12 demo + docs | (this commit) | see next update | demo job added |
 
 ## Known defects
-See `HANDOFF_FOR_CLAUDE_CODE.md` section 4 (D1 to D19). Each step's status is in that file's
-Status table.
+D1 to D19 from `HANDOFF_FOR_CLAUDE_CODE.md` section 4 are fixed (steps 1 to 12). Known limits
+of 0.1.0 are listed in README "Limits" (SQLite-only testing, single-process quotas and
+leases, per-process default HMAC keys, unsigned tool results, source-form certificates).
+
+## Not done
+- Step 13 (release) needs the owner's yes: public repo, PyPI publish, GitHub Release.
+- Step 14 (sales assets) starts after step 13.
+- Spec PDFs (CFA-SHOC v0.2, Phase 1 Addendum) were not attached, so the step 3 state-machine
+  choice was not checked against spec section 3.2.
 
 ## Signals (fill weekly after launch)
 GitHub stars, issues, PyPI downloads, Sponsors, pack sales, gig inquiries: none yet (not

@@ -143,3 +143,9 @@ supersedes an earlier one says so.
   mismatch. Leaf order is fixed by the spec; Mesh extension leaves follow in the order
   expert_calls, symbolic_steps, adjudication, energy_trace. Fixed vectors for 1/3/5/7 leaves
   live in `tests/test_provenance.py`, cross-checked against hand-built trees.
+- **2026-10-15 | Step 12: README claims are tested.** `tests/test_readme.py` executes the
+  README quick example and checks its printed output, checks that every linked file exists,
+  that every test or class named in the guarantees table exists in the linked file, and that
+  the state/transition counts in the text match the code. The demo runs as its own CI job and
+  asserts every outcome. | "Every claim in the README links to a passing test" must not rot.
+  | Historical docs moved to `docs/history/` with the required banner; CLAUDE.md paths updated.

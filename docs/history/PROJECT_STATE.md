@@ -1,3 +1,5 @@
+> **Historical, contains claims that were false when written; see README.**
+
 # CFA-SHOC Phase 1 Project State
 
 **Status:** Core implementation complete. Test suite in place. Ready for integration testing and API layer.

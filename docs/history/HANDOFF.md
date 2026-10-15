@@ -1,3 +1,5 @@
+> **Historical, contains claims that were false when written; see README.**
+
 # HANDOFF — CFA-SHOC Phase 1 (updated 2026-09-30)
 
 ## Read this first
