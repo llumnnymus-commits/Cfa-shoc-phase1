@@ -14,7 +14,6 @@ commit gate, with a hash-chained audit log.
 | 2026-10-15 | Bundle unpack, size + SHA-256 per file | Claude Code session | ALL 24 FILES OK |
 | 2026-10-15 | 18 originals vs. independent table in handoff section 2 | Claude Code session | 18/18 match |
 | 2026-10-15 | Baseline `pytest` on the imported code (Python 3.13) | Claude Code session | 3 collection errors, all D1 (`non-default argument 'approved' follows default argument 'decision_id'`) |
-
 | 2026-10-15 | Full suite after step 8 (151 tests), Python 3.11 / 3.12 / 3.13, DeprecationWarning as error | Claude Code session | 151 passed on each |
 | 2026-10-15 | Wheel build + fresh-venv install + `import cfa_shoc` | Claude Code session and CI | 0.1.0 |
 | 2026-10-15 | PyPI name `cfa-shoc` | pypi.org JSON API | 404 (free) |

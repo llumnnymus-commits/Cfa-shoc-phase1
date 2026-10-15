@@ -20,6 +20,7 @@ from .domain import (
     RawResult, ResultVerification, RiskClass, RollbackStrategy, SideEffectClass, ToolTransaction,
     TransactionEvent, TransactionState, risk_at_most,
 )
+from .audit import compute_event_hash, event_content
 from .schema import validate as validate_schema
 from .state_machine import TransactionStateMachine
 
@@ -688,12 +689,37 @@ class ToolAdapter:
     def __init__(self):
         self.adapters: Dict[str, Any] = {}
         self.status_handlers: Dict[str, Any] = {}
+        self.compensators: Dict[str, Any] = {}
 
-    def register(self, tool_id: str, handler: Any, status_handler: Any = None) -> None:
-        """Register the handler that performs a tool's operations."""
+    def register(
+        self, tool_id: str, handler: Any, status_handler: Any = None, compensator: Any = None
+    ) -> None:
+        """
+        Register the handler that performs a tool's operations, plus optional
+        ``status_handler(tool_id, external_operation_id) -> {"status", "result"}`` and
+        ``compensator(tool_id, transaction_id, external_operation_id) -> {"status"}``.
+        """
         self.adapters[tool_id] = handler
         if status_handler is not None:
             self.status_handlers[tool_id] = status_handler
+        if compensator is not None:
+            self.compensators[tool_id] = compensator
+
+    def compensate(
+        self, tool_id: str, transaction_id: Any, external_operation_id: Optional[str]
+    ) -> Optional[str]:
+        """
+        Undo a tool's side effect. Returns "succeeded" or "failed", or None when no
+        compensator is registered (a human has to act).
+        """
+        compensator = self.compensators.get(tool_id)
+        if compensator is None:
+            return None
+        try:
+            answer = compensator(tool_id, transaction_id, external_operation_id)
+        except Exception:
+            return "failed"
+        return "succeeded" if (answer or {}).get("status") == "succeeded" else "failed"
 
     def dispatch(self, request: DispatchRequest) -> Dict[str, Any]:
         """
@@ -767,20 +793,24 @@ class ToolAdapter:
         Returns {"status": "succeeded" | "failed" | "unknown", "operation_id", "result"}.
         Without a status handler the answer is "unknown" (never a guessed success).
         """
+        unknown = {"status": "unknown", "operation_id": external_operation_id,
+                   "result": None, "tool_id": tool_id}
         status_handler = self.status_handlers.get(tool_id)
         if status_handler is None:
-            return {"status": "unknown", "operation_id": external_operation_id, "result": None}
+            return unknown
         try:
             answer = status_handler(tool_id, external_operation_id)
         except Exception:
-            return {"status": "unknown", "operation_id": external_operation_id, "result": None}
-        status = answer.get("status", "unknown")
+            return unknown
+        status = (answer or {}).get("status", "unknown")
         if status not in ("succeeded", "failed", "unknown"):
             status = "unknown"
         return {
             "status": status,
             "operation_id": external_operation_id,
             "result": answer.get("result"),
+            "tool_id": tool_id,
+            "idempotency_key": answer.get("idempotency_key"),
         }
 
 
@@ -971,52 +1001,108 @@ def _hmac(key: bytes, fields: Dict[str, Any]) -> str:
 
 
 class AuditLedger:
-    """Append-only, tamper-evident event stream."""
+    """
+    Append-only, tamper-evident event stream (in-memory mirror).
+
+    Chains events per transaction with the same hash definition as durable storage
+    (cfa_shoc.audit), so the mirror and the database agree event for event. Storage is the
+    authority: use StorageManager.verify_chain for the durable record.
+    """
 
     def __init__(self):
         self.events: List[TransactionEvent] = []
+        self._last: Dict[str, TransactionEvent] = {}
 
     def append(self, event: TransactionEvent) -> TransactionEvent:
-        """Append event with hash chain."""
-        if self.events:
-            event.prior_hash = self.events[-1].event_hash
-
-        event.event_hash = self._compute_hash(event)
+        """
+        Append event with hash chain. If the event already carries a hash (from storage),
+        it must equal the one computed here.
+        """
+        key = str(event.transaction_id)
+        last = self._last.get(key)
+        if last is None and event.event_hash:
+            # First event this mirror sees for the transaction (e.g. a new process):
+            # adopt storage's position in the chain, still checking the hash below.
+            sequence, prior_hash = event.sequence, event.prior_hash
+        else:
+            sequence = 0 if last is None else last.sequence + 1
+            prior_hash = None if last is None else last.event_hash
+        computed = self._compute_hash(event, sequence, prior_hash)
+        if event.event_hash and (event.event_hash != computed or event.sequence != sequence):
+            raise AssertionError(
+                f"Audit mirror diverged from storage for transaction {key} at sequence {sequence}"
+            )
+        event.sequence, event.prior_hash, event.event_hash = sequence, prior_hash, computed
         self.events.append(event)
+        self._last[key] = event
         return event
 
     def get_for_transaction(self, transaction_id: UUID) -> List[TransactionEvent]:
         """Get all events for transaction."""
-        return [e for e in self.events if e.transaction_id == transaction_id]
+        return [e for e in self.events if str(e.transaction_id) == str(transaction_id)]
 
-    def _compute_hash(self, event: TransactionEvent) -> str:
+    def verify(self, transaction_id: UUID) -> Tuple[bool, Optional[int]]:
+        """Recompute the in-memory chain: (True, None) or (False, first bad index)."""
+        prior_hash = None
+        for index, event in enumerate(self.get_for_transaction(transaction_id)):
+            if event.sequence != index or event.prior_hash != prior_hash:
+                return False, index
+            if self._compute_hash(event, index, prior_hash) != event.event_hash:
+                return False, index
+            prior_hash = event.event_hash
+        return True, None
+
+    def _compute_hash(
+        self, event: TransactionEvent, sequence: Optional[int] = None, prior_hash: Optional[str] = None
+    ) -> str:
         """Compute event hash."""
-        data = {
-            "transaction_id": str(event.transaction_id),
-            "event_type": event.event_type,
-            "from_state": event.from_state,
-            "to_state": event.to_state,
-            "actor": f"{event.actor_type}:{event.actor_id}",
-            "timestamp": event.created_at.isoformat(),
-            "prior_hash": event.prior_hash,
-        }
-        data_str = json.dumps(data, sort_keys=True)
-        return hashlib.sha256(data_str.encode()).hexdigest()
+        return compute_event_hash(event_content(
+            event_id=event.event_id, transaction_id=event.transaction_id,
+            sequence=event.sequence if sequence is None else sequence,
+            event_type=event.event_type, from_state=event.from_state, to_state=event.to_state,
+            actor_type=event.actor_type, actor_id=event.actor_id, payload=event.payload,
+            created_at=event.created_at,
+            prior_hash=event.prior_hash if sequence is None else prior_hash,
+        ))
 
 
 class ReconciliationWorker:
     """
-    First-class service for reconciling UNKNOWN, PENDING_EXTERNAL, and
-    expired-lease transactions with provider status.
+    First-class service for reconciling UNKNOWN, PENDING_EXTERNAL, COMPENSATION_REQUIRED
+    and expired-lease (stuck DISPATCHED) transactions with provider status.
+
+    With an orchestrator, `run_once()` drives every reconcilable transaction one step
+    through RUN_TOOL_NODE.reconcile (which fires the state-machine events, verifies, and
+    commits through the action gate). Run it on a schedule.
     """
 
-    def __init__(self, adapter: ToolAdapter, verifier: ResultVerifier):
+    def __init__(self, adapter: ToolAdapter, verifier: ResultVerifier, orchestrator: Any = None):
         self.adapter = adapter
         self.verifier = verifier
+        self.orchestrator = orchestrator
+
+    def run_once(self, now: Optional[datetime] = None, limit: int = 100) -> List[Tuple[str, str]]:
+        """
+        Reconcile up to `limit` transactions. Returns (transaction_id, action) pairs, where
+        action names the event fired or why nothing was done.
+        """
+        if self.orchestrator is None:
+            raise ValueError("run_once needs an orchestrator")
+        storage = self.orchestrator.storage
+        session = storage.get_session()
+        try:
+            ids = [row.transaction_id for row in storage.find_reconcilable_transactions(session, limit)]
+        finally:
+            session.close()
+        results = []
+        for transaction_id in ids:
+            _, action = self.orchestrator.reconcile(transaction_id, now=now)
+            results.append((transaction_id, action))
+        return results
 
     def reconcile(self, tx: ToolTransaction) -> Tuple[bool, str]:
         """
-        Reconcile transaction by querying external status.
+        Query external status for one transaction without changing it.
 
         Returns:
             (success, message)
@@ -1024,7 +1110,6 @@ class ReconciliationWorker:
         if tx.external_operation_id is None:
             return False, "No external operation ID to reconcile"
 
-        # Query provider status
         status_result = self.adapter.query_status(tx.tool_id, tx.external_operation_id)
 
         if status_result["status"] == "succeeded":

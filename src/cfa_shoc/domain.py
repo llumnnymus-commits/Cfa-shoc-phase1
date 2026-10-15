@@ -243,6 +243,7 @@ class TransactionEvent:
     actor_type: str = ""  # system, connector, user, recovery
     actor_id: str = ""
     payload: Dict[str, Any] = field(default_factory=dict)
+    sequence: int = 0  # position in this transaction's chain, from 0
     prior_hash: Optional[str] = None
     event_hash: str = ""
     created_at: datetime = field(default_factory=utcnow)

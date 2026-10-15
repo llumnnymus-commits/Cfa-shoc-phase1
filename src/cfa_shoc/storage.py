@@ -5,12 +5,14 @@ PostgreSQL schema and ORM models for transaction truth and audit ledger.
 """
 
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
+from uuid import uuid4
 from sqlalchemy import (
     JSON, Column, DateTime, ForeignKey, Integer, String, Text, TypeDecorator, create_engine, Index
 )
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
+from .audit import compute_event_hash, event_content
 from .domain import utcnow
 
 Base = declarative_base()
@@ -87,6 +89,7 @@ class TransactionEventORM(Base):
 
     event_id = Column(String(36), primary_key=True)
     transaction_id = Column(String(36), ForeignKey("tool_transactions.transaction_id"), nullable=False)
+    sequence = Column(Integer, nullable=False)  # position in this transaction's chain, from 0
     event_type = Column(String(100), nullable=False)
     from_state = Column(String(50))
     to_state = Column(String(50))
@@ -99,6 +102,7 @@ class TransactionEventORM(Base):
 
     __table_args__ = (
         Index("ix_event_transaction", "transaction_id"),
+        Index("ux_event_transaction_sequence", "transaction_id", "sequence", unique=True),
         Index("ix_event_type", "event_type"),
         Index("ix_event_created", "created_at"),
     )
@@ -221,8 +225,7 @@ class StorageManager:
         """
         try:
             self._upsert_transaction(session, tx_data)
-            event = TransactionEventORM(**event_data)
-            session.add(event)
+            event = self._chain_event(session, event_data)
             session.commit()
             return event
         except Exception:
@@ -258,11 +261,77 @@ class StorageManager:
         ).first()
 
     def append_event(self, session: Session, event_data: Dict[str, Any]) -> TransactionEventORM:
-        """Append an audit event (append-only)."""
-        event = TransactionEventORM(**event_data)
+        """
+        Append an audit event (append-only). The hash chain is computed here; any
+        `sequence`, `prior_hash` or `event_hash` passed in is ignored.
+        """
+        try:
+            event = self._chain_event(session, event_data)
+            session.commit()
+            return event
+        except Exception:
+            session.rollback()
+            raise
+
+    def _chain_event(self, session: Session, event_data: Dict[str, Any]) -> TransactionEventORM:
+        """Link the event to the transaction's last stored event and add it (no commit)."""
+        data = {k: v for k, v in event_data.items() if k not in ("sequence", "prior_hash", "event_hash")}
+        data.setdefault("event_id", str(uuid4()))
+        data.setdefault("payload", {})
+        data.setdefault("from_state", None)
+        data.setdefault("to_state", None)
+        created_at = data.get("created_at") or utcnow()
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        data["created_at"] = created_at.astimezone(timezone.utc)
+
+        last = session.query(TransactionEventORM).filter(
+            TransactionEventORM.transaction_id == data["transaction_id"]
+        ).order_by(TransactionEventORM.sequence.desc()).first()
+        sequence = 0 if last is None else last.sequence + 1
+        prior_hash = None if last is None else last.event_hash
+
+        content = event_content(
+            event_id=data["event_id"], transaction_id=data["transaction_id"], sequence=sequence,
+            event_type=data["event_type"], from_state=data["from_state"],
+            to_state=data["to_state"], actor_type=data["actor_type"], actor_id=data["actor_id"],
+            payload=data["payload"], created_at=data["created_at"], prior_hash=prior_hash,
+        )
+        event = TransactionEventORM(
+            **data, sequence=sequence, prior_hash=prior_hash, event_hash=compute_event_hash(content)
+        )
         session.add(event)
-        session.commit()
+        session.flush()
         return event
+
+    def verify_chain(self, transaction_id: str) -> Tuple[bool, Optional[int]]:
+        """
+        Recompute a transaction's audit chain from storage.
+
+        Returns:
+            (True, None) when every event is intact and linked; otherwise
+            (False, index of the first event that is missing, edited or out of order)
+        """
+        session = self.get_session()
+        try:
+            events = self.get_events_for_transaction(session, str(transaction_id))
+            prior_hash = None
+            for index, event in enumerate(events):
+                if event.sequence != index or event.prior_hash != prior_hash:
+                    return False, index
+                content = event_content(
+                    event_id=event.event_id, transaction_id=event.transaction_id,
+                    sequence=event.sequence, event_type=event.event_type,
+                    from_state=event.from_state, to_state=event.to_state,
+                    actor_type=event.actor_type, actor_id=event.actor_id,
+                    payload=event.payload, created_at=event.created_at, prior_hash=event.prior_hash,
+                )
+                if compute_event_hash(content) != event.event_hash:
+                    return False, index
+                prior_hash = event.event_hash
+            return True, None
+        finally:
+            session.close()
 
     def get_events_for_transaction(
         self, session: Session, transaction_id: str
@@ -270,7 +339,7 @@ class StorageManager:
         """Get all events for a transaction."""
         return session.query(TransactionEventORM).filter(
             TransactionEventORM.transaction_id == transaction_id
-        ).order_by(TransactionEventORM.created_at).all()
+        ).order_by(TransactionEventORM.sequence).all()
 
     def save_commit_decision(self, session: Session, decision_data: Dict[str, Any]) -> CommitDecisionORM:
         """Save a commit decision."""
@@ -311,17 +380,26 @@ class StorageManager:
             return True
         return False
 
+    RECONCILABLE_STATES = ("UNKNOWN", "PENDING_EXTERNAL", "COMPENSATION_REQUIRED", "DISPATCHED")
+
     def find_reconcilable_transactions(
         self, session: Session, limit: int = 100
     ) -> list[ToolTransactionORM]:
-        """Find UNKNOWN, PENDING_EXTERNAL, and expired-lease transactions."""
-        from sqlalchemy import or_
+        """
+        Find transactions the reconciliation worker must look at: UNKNOWN,
+        PENDING_EXTERNAL, COMPENSATION_REQUIRED, and DISPATCHED ones (the worker acts on
+        DISPATCHED only when no unexpired lease is held, i.e. the dispatcher died).
+        """
         return session.query(ToolTransactionORM).filter(
-            or_(
-                ToolTransactionORM.state == "UNKNOWN",
-                ToolTransactionORM.state == "PENDING_EXTERNAL",
-            )
-        ).limit(limit).all()
+            ToolTransactionORM.state.in_(self.RECONCILABLE_STATES)
+        ).order_by(ToolTransactionORM.created_at).limit(limit).all()
+
+    def has_live_lease(self, session: Session, transaction_id: str) -> bool:
+        """True when an unexpired dispatch lease exists for the transaction."""
+        return session.query(DispatchLeaseORM).filter(
+            DispatchLeaseORM.transaction_id == transaction_id,
+            DispatchLeaseORM.expires_at > utcnow(),
+        ).first() is not None
 
     def close(self) -> None:
         """Close database connections."""

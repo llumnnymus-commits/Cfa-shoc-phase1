@@ -103,3 +103,19 @@ supersedes an earlier one says so.
   Phase 1: `signature_valid` is reported False and is not required. | D11. | Honest reporting.
 - **2026-10-15 | Step 8: commit gate** also requires state VERIFIED, a passed verification and
   a result envelope, besides unchanged ledger/contract and preconditions. | Invariant 3.3. |
+- **2026-10-15 | Step 9: storage is the authority for the audit chain.** Each event row has
+  `sequence` (unique per transaction), `prior_hash` and `event_hash`; `StorageManager` computes
+  them on append (caller-supplied hashes are ignored). The hash covers event id, transaction id,
+  sequence, type, states, actor, payload, UTC timestamp and prior hash (`cfa_shoc/audit.py`,
+  shared with the in-memory `AuditLedger`, which now chains per transaction and raises if it
+  ever diverges from storage). `verify_chain(tx_id) -> (ok, first_bad_index)`. | D10. |
+  Limitation: rewriting the *last* event together with its hash is undetectable without an
+  external anchor; provenance certificates (step 11) provide that anchor.
+- **2026-10-15 | Step 9: reconciliation lives in `RUN_TOOL_NODE.reconcile(tx_id, now=None)`**
+  and `ReconciliationWorker(adapter, verifier, orchestrator).run_once()` loops over it. Provider
+  succeeded -> verify -> VERIFIED -> commit through the action gate; failed -> FAILED; unknown ->
+  wait until the deadline (async 24 h, unknown 1 h), then PENDING_EXTERNAL -> UNKNOWN and
+  UNKNOWN -> FAILED (side effect none) or COMPENSATION_REQUIRED. Compensation uses an optional
+  per-tool compensator; without one a human must act. A DISPATCHED transaction with no live
+  lease (dead dispatcher) -> UNKNOWN. | Reuses the one transition/commit path instead of a
+  second implementation. | The old `reconcile(tx)` query method is kept.
