@@ -71,3 +71,35 @@ supersedes an earlier one says so.
   suite runs with `-W error::DeprecationWarning` cleanly.
 - **2026-10-15 | Step 7: CI actions bumped to checkout@v5 / setup-python@v6.** | CI warned
   that Node 20 actions are deprecated. | No behavior change.
+- **2026-10-15 | Step 8: built-in schema validator (`cfa_shoc/schema.py`), not `jsonschema`.**
+  Supports type, required, properties, additionalProperties(false), enum, min/maxLength,
+  minimum/maximum, items, maxItems. Tools declare `input_schema` and optionally `output_schema`.
+  | Keeps the runtime dependency list to SQLAlchemy (CLAUDE.md). | Unknown keywords are
+  ignored; a full JSON Schema implementation can replace it later without API change.
+- **2026-10-15 | Step 8: quotas.** Limits live in the ledger `quotas` as
+  `{tenant_id | "*": {tool_id: max_calls}}` (hashed). Usage counters are kept outside the
+  hash and consumed at `dispatch_started`. | Consuming quota must not change the ledger hash
+  and block the commit. | Counters are in-memory per CapabilitySnapshotService (Phase 1 limit).
+- **2026-10-15 | Step 8: conflicts.** Preflight refuses a proposal when another in-flight
+  (non-terminal) transaction of the same tenant has the same idempotency key, or when the tool is
+  declared `exclusive` and has an in-flight transaction for the tenant. RUN_TOOL_NODE gives
+  PreflightService its storage when none was passed. | D11. | Without storage the check reports
+  `no_conflict_skipped`.
+- **2026-10-15 | Step 8: policy lanes.** A = LOW + NONE/REVERSIBLE. B = contract
+  `pre_authorized` entry `{tool_id, operation ("*" ok), max_risk}` covers the proposal. C =
+  opt-in with contract `confirm_up_to`: proposals at or below it wait in PREFLIGHTED
+  (`confirmation_requested` event) until `RUN_TOOL_NODE.confirm(tx_id, approver_id)` or
+  `decline(...)`. A confirmation request expires after 1 hour (then REJECTED). Without
+  `confirm_up_to` behavior stays deny-by-default. | D12. | Medium risk without B or C is
+  still REJECTED, as step 5 requires.
+- **2026-10-15 | Step 8: HMAC-SHA256 signatures** over all decision fields for policy and
+  commit decisions, with keys injected at construction (`signing_key=`, >= 16 bytes). Default is
+  a random per-instance key, so decisions verify only within that process unless a key is
+  supplied. Keys are held in `_SecretKey` (repr `<hidden>`) and never stored or logged. Step 5
+  verifies signature + expiry; a failure fires `authorization_revoked`. | D13. | Asymmetric
+  (Ed25519) signing arrives with provenance in step 11.
+- **2026-10-15 | Step 8: result verifier.** Checks terminal success status, declared output
+  schema, tool/connector match and idempotency-key echo. Tool results are not signed in
+  Phase 1: `signature_valid` is reported False and is not required. | D11. | Honest reporting.
+- **2026-10-15 | Step 8: commit gate** also requires state VERIFIED, a passed verification and
+  a result envelope, besides unchanged ledger/contract and preconditions. | Invariant 3.3. |

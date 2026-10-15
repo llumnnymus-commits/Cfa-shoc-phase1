@@ -6,7 +6,9 @@ Core services for capability management, preflight checks, policy decisions, etc
 
 import copy
 import hashlib
+import hmac
 import json
+import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID, uuid4
@@ -16,8 +18,9 @@ from .domain import (
     ActionProposal, CommitDecision, CommitRequest, DispatchRequest, DispatchLease,
     IdempotencyClass, ObservationEnvelope, PolicyDecision, PreflightResult,
     RawResult, ResultVerification, RiskClass, RollbackStrategy, SideEffectClass, ToolTransaction,
-    TransactionEvent, TransactionState,
+    TransactionEvent, TransactionState, risk_at_most,
 )
+from .schema import validate as validate_schema
 from .state_machine import TransactionStateMachine
 
 
@@ -41,6 +44,9 @@ class CapabilitySnapshotService:
         self.current_snapshot = {key: {} for key in self.CONTENT_KEYS}
         self.snapshots = []
         self.contracts: Dict[str, Dict[str, Any]] = {}
+        # Quota usage counters: kept outside the hashed ledger content, so consuming quota
+        # does not change the ledger hash between authorization and commit.
+        self.quota_used: Dict[Tuple[str, str], int] = {}
 
     def refresh_snapshot(self, principal_id: str, tenant_id: str) -> Dict[str, Any]:
         """
@@ -101,6 +107,30 @@ class CapabilitySnapshotService:
     def update_tool_state(self, tool_id: str, state: Dict[str, Any]) -> None:
         """Update tool state (internal operation)."""
         self.current_snapshot["tools"][tool_id] = state
+
+    def quota_limit(self, tenant_id: str, tool_id: str) -> Optional[int]:
+        """
+        Call limit for a tenant and tool from the ledger's `quotas`
+        ({tenant_id: {tool_id: limit}}, with "*" as a wildcard tenant), or None.
+        """
+        quotas = self.current_snapshot["quotas"]
+        for tenant_key in (tenant_id, "*"):
+            limit = quotas.get(tenant_key, {}).get(tool_id)
+            if limit is not None:
+                return int(limit)
+        return None
+
+    def quota_remaining(self, tenant_id: str, tool_id: str) -> Optional[int]:
+        """Calls left for a tenant and tool, or None when no limit is set."""
+        limit = self.quota_limit(tenant_id, tool_id)
+        if limit is None:
+            return None
+        return max(0, limit - self.quota_used.get((tenant_id, tool_id), 0))
+
+    def consume_quota(self, tenant_id: str, tool_id: str) -> None:
+        """Count one dispatch against the tenant's quota for the tool."""
+        key = (tenant_id, tool_id)
+        self.quota_used[key] = self.quota_used.get(key, 0) + 1
 
     def register_contract(self, episode_id: Any, contract: Dict[str, Any]) -> None:
         """Register (or replace) the episode contract that commit-time checks re-read."""
@@ -226,11 +256,21 @@ class ActionNormalizer:
 class PreflightService:
     """
     Performs deterministic checks before authorization or dispatch.
-    Validates ledger, tool, connector, scopes, schema, quota, risk policy.
+    Validates ledger, tool, connector, scopes, schema, quota, risk policy, conflicts.
+
+    The conflict check needs transaction storage; RUN_TOOL_NODE supplies its own storage
+    when none was given here. Without storage the conflict check is reported as skipped.
     """
 
-    def __init__(self, capability_service: CapabilitySnapshotService):
+    # States in which a transaction is still in flight (not final and not committed)
+    IN_FLIGHT_STATES = [
+        state.value for state in TransactionState
+        if state not in TransactionStateMachine.TERMINAL_STATES
+    ]
+
+    def __init__(self, capability_service: CapabilitySnapshotService, storage: Any = None):
         self.capability_service = capability_service
+        self.storage = storage
 
     def check(
         self, proposal: ActionProposal, ledger: Dict[str, Any], episode_contract: Dict[str, Any]
@@ -243,6 +283,7 @@ class PreflightService:
         """
         checks = []
         failures = []
+        tool = self.capability_service.get_tool(proposal.tool_id)
 
         # 1. Ledger currency and validity
         if not self._check_ledger_current(ledger):
@@ -250,7 +291,7 @@ class PreflightService:
         checks.append("ledger_valid")
 
         # 2. Tool exists and callable
-        if not self.capability_service.is_tool_available(proposal.tool_id):
+        if tool is None:
             failures.append(f"Tool {proposal.tool_id} not available")
         checks.append("tool_available")
 
@@ -266,9 +307,10 @@ class PreflightService:
             failures.append(f"Missing required scopes: {required_scopes}")
         checks.append("scopes_valid")
 
-        # 5. Input validates against schema
-        if not self._check_schema(proposal.arguments, proposal.tool_id):
-            failures.append("Arguments do not validate against schema")
+        # 5. Input validates against the tool's declared input schema
+        schema_errors = self._schema_errors(proposal.arguments, tool)
+        if schema_errors:
+            failures.append("Arguments do not validate against schema: " + "; ".join(schema_errors))
         checks.append("schema_valid")
 
         # 6. Quota sufficient
@@ -276,15 +318,19 @@ class PreflightService:
             failures.append("Quota exhausted")
         checks.append("quota_available")
 
-        # 7. Risk policy allows
-        if not self._check_risk_policy(proposal.risk_class):
-            failures.append(f"Risk class {proposal.risk_class} not allowed by policy")
+        # 7. Risk policy allows (contract max_risk caps the risk class)
+        if not self._check_risk_policy(proposal.risk_class, episode_contract):
+            failures.append(
+                f"Risk class {proposal.risk_class.value} exceeds contract max_risk "
+                f"{episode_contract.get('max_risk')}"
+            )
         checks.append("risk_allowed")
 
         # 8. No conflicting active transaction
-        if not self._check_no_conflict(proposal.tool_id, proposal.tenant_id):
-            failures.append("Conflicting transaction already active")
-        checks.append("no_conflict")
+        conflict = self._conflict(proposal, tool)
+        if conflict:
+            failures.append(conflict)
+        checks.append("no_conflict" if self.storage is not None else "no_conflict_skipped")
 
         return PreflightResult(
             allowed=len(failures) == 0,
@@ -294,44 +340,111 @@ class PreflightService:
         )
 
     def _check_ledger_current(self, ledger: Dict[str, Any]) -> bool:
-        """Verify ledger is current and valid."""
-        return ledger.get("hash") is not None
+        """Verify ledger is current: it has a hash and matches the live capability content."""
+        if ledger.get("hash") is None:
+            return False
+        version = ledger.get("content_version")
+        return version is None or version == self.capability_service.content_version
 
     def _check_scopes(self, contract: Dict[str, Any], required_scopes: List[str]) -> bool:
         """Verify required scopes are granted."""
         granted_scopes = contract.get("scopes", [])
         return all(scope in granted_scopes for scope in required_scopes)
 
+    def _schema_errors(self, arguments: Dict[str, Any], tool: Optional[Dict[str, Any]]) -> List[str]:
+        """Validate arguments against the tool's `input_schema` (none declared: valid)."""
+        if not tool:
+            return []
+        return validate_schema(arguments, tool.get("input_schema"))
+
     def _check_schema(self, arguments: Dict[str, Any], tool_id: str) -> bool:
         """Validate arguments against tool schema."""
-        # Simplified: in production, use JSON Schema validation
-        return True
+        return not self._schema_errors(arguments, self.capability_service.get_tool(tool_id))
 
     def _check_quota(self, tool_id: str, tenant_id: str) -> bool:
-        """Check quota is available."""
-        # Simplified: in production, check actual quota state
-        return True
+        """Check quota is available (no limit set: available)."""
+        remaining = self.capability_service.quota_remaining(tenant_id, tool_id)
+        return remaining is None or remaining > 0
 
-    def _check_risk_policy(self, risk_class: RiskClass) -> bool:
-        """Check if risk class is allowed by policy."""
-        # Allow all risk classes in Phase 1
-        return True
+    def _check_risk_policy(self, risk_class: RiskClass, contract: Optional[Dict[str, Any]] = None) -> bool:
+        """Check the risk class against the contract's max_risk (no cap: allowed)."""
+        cap = (contract or {}).get("max_risk")
+        if cap is None:
+            return True
+        try:
+            return risk_at_most(risk_class, cap)
+        except ValueError:
+            return False  # an unreadable cap fails closed
+
+    def _conflict(self, proposal: ActionProposal, tool: Optional[Dict[str, Any]]) -> Optional[str]:
+        """Describe a conflicting in-flight transaction, or None."""
+        if self.storage is None:
+            return None
+        session = self.storage.get_session()
+        try:
+            same_key = [
+                row for row in self.storage.find_by_idempotency_key(
+                    session, proposal.tenant_id, proposal.idempotency_key, self.IN_FLIGHT_STATES
+                )
+                if row.proposal_id != str(proposal.proposal_id)
+            ]
+            if same_key:
+                return (
+                    f"Conflicting transaction already active: {same_key[0].transaction_id} "
+                    f"has the same idempotency key ({same_key[0].state})"
+                )
+            if tool and tool.get("exclusive"):
+                busy = [
+                    row for row in self.storage.find_in_flight(
+                        session, proposal.tenant_id, proposal.tool_id, self.IN_FLIGHT_STATES
+                    )
+                    if row.proposal_id != str(proposal.proposal_id)
+                ]
+                if busy:
+                    return (
+                        f"Conflicting transaction already active: exclusive tool "
+                        f"{proposal.tool_id} is in use by {busy[0].transaction_id}"
+                    )
+            return None
+        finally:
+            session.close()
 
     def _check_no_conflict(self, tool_id: str, tenant_id: str) -> bool:
-        """Verify no conflicting transaction is active."""
-        # Simplified: in production, check transaction state
-        return True
+        """Verify no transaction is in flight for an exclusive tool and tenant."""
+        if self.storage is None:
+            return True
+        session = self.storage.get_session()
+        try:
+            return not self.storage.find_in_flight(session, tenant_id, tool_id, self.IN_FLIGHT_STATES)
+        finally:
+            session.close()
 
 
 class PolicyDecisionPoint:
     """
     Evaluates ActionProposal against policy.
     Returns signed, short-lived policy decisions.
-    Model cannot manufacture or edit decisions.
+    Model cannot manufacture or edit decisions: they are HMAC-SHA256 signed with a key
+    injected at construction (a random per-instance key when none is given).
+
+    Lanes:
+      A  automatic: LOW risk with NONE or REVERSIBLE side effects.
+      B  pre-authorized: the contract's `pre_authorized` list has an entry
+         {"tool_id", "operation" ("*" = any), "max_risk"} covering the proposal.
+      C  explicit confirmation: anything else at or below contract `confirm_up_to`
+         returns requires_confirmation; RUN_TOOL_NODE.confirm() completes it.
+      Everything else is denied.
     """
 
-    def __init__(self):
+    DECISION_TTL = timedelta(minutes=5)
+    CONFIRMATION_TTL = timedelta(hours=1)
+
+    def __init__(self, signing_key: Optional[bytes] = None):
         self.decisions_cache = {}
+        self.__key = _SecretKey(signing_key if signing_key is not None else os.urandom(32))
+
+    def __repr__(self) -> str:  # never show the key
+        return "PolicyDecisionPoint(signing_key=<hidden>)"
 
     def evaluate(
         self, proposal: ActionProposal, ledger: Dict[str, Any], contract: Dict[str, Any]
@@ -340,53 +453,131 @@ class PolicyDecisionPoint:
         Evaluate proposal against policy.
 
         Returns:
-            Signed policy decision (APPROVE or DENY)
+            Signed policy decision (approved, denied, or requires_confirmation)
         """
-        decision_id = uuid4()
-
-        # Simplified policy: approve if all checks pass
-        approved = self._apply_policy_rules(proposal, contract)
-
+        lane, approved, requires_confirmation, reason, checks = self._apply_policy_rules(
+            proposal, contract
+        )
+        ttl = self.CONFIRMATION_TTL if requires_confirmation else self.DECISION_TTL
         decision = PolicyDecision(
-            decision_id=decision_id,
             approved=approved,
-            reason="Policy check passed" if approved else "Policy check failed",
+            reason=reason,
             subject_type="action",
             subject_ref=str(proposal.proposal_id),
-            contract_hash=contract.get("hash", ""),
+            contract_hash=CapabilitySnapshotService.contract_hash(contract),
             ledger_hash=ledger.get("hash", ""),
-            signature=self._sign_decision(decision_id, approved, contract),
-            expires_at=utcnow() + timedelta(minutes=5),
+            checks=checks,
+            expires_at=utcnow() + ttl,
             approver_type="system",
             approver_id="policy_engine",
+            lane=lane,
+            requires_confirmation=requires_confirmation,
         )
-
-        self.decisions_cache[str(decision_id)] = decision
+        decision.signature = self.sign(decision)
+        self.decisions_cache[str(decision.decision_id)] = decision
         return decision
 
-    def _apply_policy_rules(self, proposal: ActionProposal, contract: Dict[str, Any]) -> bool:
-        """Apply policy rules to proposal."""
-        # Phase 1: Simplified policy - approve read-only, low-risk, reversible actions automatically
-        # Lane A: Automatic (no confirmation needed)
-        if (proposal.risk_class == RiskClass.LOW and
-            proposal.side_effect_class in (SideEffectClass.NONE, SideEffectClass.REVERSIBLE)):
-            return True
+    def confirm(self, pending: PolicyDecision, approver_id: str) -> PolicyDecision:
+        """
+        Lane C: turn a verified, unexpired requires_confirmation decision into a signed
+        approval by a named approver.
 
-        # Lane B: User-authorized in contract (checked elsewhere)
-        # Lane C: Explicit confirmation (handled by authorization layer)
+        Raises:
+            ValueError: the pending decision is not a valid, open confirmation request
+        """
+        if not pending.requires_confirmation:
+            raise ValueError("Decision does not require confirmation")
+        if not self.verify_signature(pending):
+            raise ValueError("Pending decision signature is invalid")
+        if pending.expires_at < utcnow():
+            raise ValueError("Confirmation request has expired")
+        if not approver_id:
+            raise ValueError("approver_id is required")
+        decision = PolicyDecision(
+            approved=True,
+            reason=f"Explicitly confirmed by {approver_id}",
+            subject_type=pending.subject_type,
+            subject_ref=pending.subject_ref,
+            contract_hash=pending.contract_hash,
+            ledger_hash=pending.ledger_hash,
+            evidence_refs=[f"policy:{pending.decision_id}"],
+            checks={**pending.checks, "explicit_confirmation": True},
+            expires_at=utcnow() + self.DECISION_TTL,
+            approver_type="human",
+            approver_id=approver_id,
+            lane="C",
+            requires_confirmation=False,
+        )
+        decision.signature = self.sign(decision)
+        self.decisions_cache[str(decision.decision_id)] = decision
+        return decision
 
-        # Default: deny if not explicitly approved
-        return False
+    def _apply_policy_rules(
+        self, proposal: ActionProposal, contract: Dict[str, Any]
+    ) -> Tuple[str, bool, bool, str, Dict[str, bool]]:
+        """Return (lane, approved, requires_confirmation, reason, checks)."""
+        lane_a = (
+            proposal.risk_class == RiskClass.LOW
+            and proposal.side_effect_class in (SideEffectClass.NONE, SideEffectClass.REVERSIBLE)
+        )
+        lane_b = any(self._covers(entry, proposal) for entry in contract.get("pre_authorized", []))
+        confirm_cap = contract.get("confirm_up_to")
+        lane_c = False
+        if confirm_cap is not None:
+            try:
+                lane_c = risk_at_most(proposal.risk_class, confirm_cap)
+            except ValueError:
+                lane_c = False
+        checks = {"lane_a": lane_a, "lane_b": lane_b, "lane_c_eligible": lane_c}
 
-    def _sign_decision(self, decision_id: UUID, approved: bool, contract: Dict[str, Any]) -> str:
-        """Sign policy decision."""
-        data_to_sign = {
-            "decision_id": str(decision_id),
-            "approved": approved,
-            "timestamp": utcnow().isoformat(),
+        if lane_a:
+            return "A", True, False, "Approved automatically (lane A: low risk, no lasting side effect)", checks
+        if lane_b:
+            return "B", True, False, "Approved by contract pre-authorization (lane B)", checks
+        if lane_c:
+            return "C", False, True, "Explicit confirmation required (lane C)", checks
+        return "", False, False, (
+            f"Policy check failed: risk {proposal.risk_class.value} with side effect "
+            f"{proposal.side_effect_class.value} is not automatic, pre-authorized or confirmable"
+        ), checks
+
+    @staticmethod
+    def _covers(entry: Dict[str, Any], proposal: ActionProposal) -> bool:
+        if not isinstance(entry, dict) or entry.get("tool_id") != proposal.tool_id:
+            return False
+        if entry.get("operation", "*") not in ("*", proposal.operation):
+            return False
+        try:
+            return risk_at_most(proposal.risk_class, entry.get("max_risk", RiskClass.LOW.value))
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _signed_fields(decision: PolicyDecision) -> Dict[str, Any]:
+        return {
+            "decision_id": str(decision.decision_id),
+            "approved": decision.approved,
+            "reason": decision.reason,
+            "subject_type": decision.subject_type,
+            "subject_ref": decision.subject_ref,
+            "contract_hash": decision.contract_hash,
+            "ledger_hash": decision.ledger_hash,
+            "evidence_refs": list(decision.evidence_refs),
+            "checks": dict(decision.checks),
+            "expires_at": decision.expires_at.isoformat(),
+            "approver_type": decision.approver_type,
+            "approver_id": decision.approver_id,
+            "lane": decision.lane,
+            "requires_confirmation": decision.requires_confirmation,
         }
-        data_str = json.dumps(data_to_sign, sort_keys=True)
-        return hashlib.sha256(data_str.encode()).hexdigest()
+
+    def sign(self, decision: PolicyDecision) -> str:
+        """HMAC-SHA256 over the decision's fields (everything except the signature)."""
+        return _hmac(self.__key.value, self._signed_fields(decision))
+
+    def verify_signature(self, decision: PolicyDecision) -> bool:
+        """True when the signature matches this point's key and the decision's fields."""
+        return bool(decision.signature) and hmac.compare_digest(decision.signature, self.sign(decision))
 
 
 class TransactionCoordinator:
@@ -618,42 +809,81 @@ def to_raw_result(raw: Any) -> Optional[RawResult]:
 
 class ResultVerifier:
     """
-    Checks result signature, schema, and consistency.
-    Distinguishes authenticated results from evidence.
+    Checks a raw tool result before it can be committed:
+      - status_terminal: the adapter reported a finished, successful call ("ok")
+      - schema_valid: output matches the tool's declared `output_schema`, if any
+      - tool_connector_match: the result is for this transaction's tool and connector
+      - idempotency: an echoed idempotency key must match; tools declaring
+        `echoes_idempotency_key: True` must echo it
+    Results are not signed by tools in Phase 1, so `signature_valid` is reported as False
+    and is not required to pass. The result stays non-authoritative content.
+
+    RUN_TOOL_NODE supplies its capability service when none was given here.
     """
+
+    def __init__(self, capability_service: Optional[CapabilitySnapshotService] = None):
+        self.capability_service = capability_service
 
     def verify(self, raw_result: Any, tx: ToolTransaction) -> ResultVerification:
         """Verify raw result (RawResult or adapter dict) from tool."""
-        raw_result = to_raw_result(raw_result)
-        checks = {
-            "signature_valid": True,  # Simplified
-            "schema_valid": True,
-            "tool_connector_match": True,
-            "status_terminal": True,
-        }
+        raw = to_raw_result(raw_result)
+        if raw is None:
+            return ResultVerification(passed=False, reason="No result")
+        tool = self.capability_service.get_tool(tx.tool_id) if self.capability_service else None
+        tool = tool or {}
+        problems: List[str] = []
 
-        verification = ResultVerification(
-            passed=all(checks.values()),
-            reason="Result verification passed" if all(checks.values()) else "Verification failed",
-            signature_valid=checks["signature_valid"],
-            schema_valid=checks["schema_valid"],
-            tool_connector_match=checks["tool_connector_match"],
-            status_terminal=checks["status_terminal"],
+        status_terminal = raw.transport_status == "ok"
+        if not status_terminal:
+            problems.append(f"status not terminal-success ({raw.transport_status})")
+
+        schema_errors = validate_schema(raw.output, tool.get("output_schema"))
+        if schema_errors:
+            problems.append("output schema: " + "; ".join(schema_errors))
+
+        tool_connector_match = raw.tool_id == tx.tool_id and raw.connector_id == tx.connector_id
+        if not tool_connector_match:
+            problems.append(
+                f"result is for {raw.tool_id}/{raw.connector_id}, expected {tx.tool_id}/{tx.connector_id}"
+            )
+
+        idempotency_ok = True
+        if raw.idempotency_key is not None and raw.idempotency_key != tx.idempotency_key:
+            idempotency_ok = False
+            problems.append("echoed idempotency key does not match")
+        elif tool.get("echoes_idempotency_key") and raw.idempotency_key is None:
+            idempotency_ok = False
+            problems.append("tool must echo the idempotency key but did not")
+
+        return ResultVerification(
+            passed=not problems,
+            reason="Result verification passed" if not problems else "; ".join(problems),
+            signature_valid=False,
+            schema_valid=not schema_errors,
+            tool_connector_match=tool_connector_match,
+            status_terminal=status_terminal,
             evidence={
                 "idempotency_key": tx.idempotency_key,
+                "idempotency_ok": idempotency_ok,
                 "transaction_id": str(tx.transaction_id),
+                "external_operation_id": raw.external_operation_id,
             },
         )
-
-        return verification
 
 
 class CommitMembrane:
     """
     Only component permitted to commit verified results into durable state.
     Reloads contract and capability ledger at time of commit.
-    Enforces all commit invariants.
+    Enforces all commit invariants. Commit decisions are HMAC-SHA256 signed with a key
+    injected at construction (a random per-instance key when none is given).
     """
+
+    def __init__(self, signing_key: Optional[bytes] = None):
+        self.__key = _SecretKey(signing_key if signing_key is not None else os.urandom(32))
+
+    def __repr__(self) -> str:  # never show the key
+        return "CommitMembrane(signing_key=<hidden>)"
 
     def action_gate(
         self, request: CommitRequest, tx: ToolTransaction,
@@ -662,43 +892,82 @@ class CommitMembrane:
         """
         Action gate: commit or reject verified result.
 
-        Reloads and re-validates all state at commit time.
+        Reloads and re-validates all state at commit time. Returns (False, None) when any
+        check fails.
         """
-        # Re-validate preconditions
-        for predicate in request.expected_preconditions:
-            if not predicate.condition:
-                return False, None
-
-        # Check ledger hasn't changed
-        if current_ledger.get("hash") != request.ledger_hash:
+        checks = {
+            "same_transaction": request.transaction_id == tx.transaction_id,
+            "state_verified": tx.state == TransactionState.VERIFIED,
+            "verification_passed": bool(tx.verification and tx.verification.get("passed")),
+            "result_envelope_present": tx.result_envelope is not None,
+            "preconditions_hold": all(p.condition for p in request.expected_preconditions),
+            "ledger_unchanged": current_ledger.get("hash") == request.ledger_hash,
+            "contract_unchanged": current_contract.get("hash") == request.contract_hash,
+        }
+        if not all(checks.values()):
             return False, None
 
-        # Check contract hasn't changed
-        if current_contract.get("hash") != request.contract_hash:
-            return False, None
-
-        # Create and sign decision
         decision = CommitDecision(
-            decision_id=uuid4(),
             transaction_id=request.transaction_id,
             subject_type="action",
             subject_ref=str(request.transaction_id),
             contract_hash=request.contract_hash,
             ledger_hash=request.ledger_hash,
-            evidence_refs=request.evidence_refs,
-            checks={"all_invariants_hold": True},
+            evidence_refs=list(request.evidence_refs),
+            checks=checks,
             decision="APPROVE",
-            signature=self._sign_decision(request.transaction_id),
             expires_at=utcnow() + timedelta(hours=1),
+            approver_type="system",
+            approver_id="commit_membrane",
         )
-
+        decision.signature = self.sign(decision)
         return True, decision
 
-    def _sign_decision(self, transaction_id: UUID) -> str:
-        """Sign commit decision."""
-        data = {"transaction_id": str(transaction_id), "timestamp": utcnow().isoformat()}
-        data_str = json.dumps(data, sort_keys=True)
-        return hashlib.sha256(data_str.encode()).hexdigest()
+    @staticmethod
+    def _signed_fields(decision: CommitDecision) -> Dict[str, Any]:
+        return {
+            "decision_id": str(decision.decision_id),
+            "transaction_id": str(decision.transaction_id),
+            "subject_type": decision.subject_type,
+            "subject_ref": decision.subject_ref,
+            "contract_hash": decision.contract_hash,
+            "ledger_hash": decision.ledger_hash,
+            "evidence_refs": list(decision.evidence_refs),
+            "checks": dict(decision.checks),
+            "decision": decision.decision,
+            "expires_at": decision.expires_at.isoformat(),
+            "approver_type": decision.approver_type,
+            "approver_id": decision.approver_id,
+        }
+
+    def sign(self, decision: CommitDecision) -> str:
+        """HMAC-SHA256 over the decision's fields (everything except the signature)."""
+        return _hmac(self.__key.value, self._signed_fields(decision))
+
+    def verify_signature(self, decision: CommitDecision) -> bool:
+        """True when the signature matches this membrane's key and the decision's fields."""
+        return bool(decision.signature) and hmac.compare_digest(decision.signature, self.sign(decision))
+
+
+class _SecretKey:
+    """Holds signing key bytes; repr/str never show them, so logging a service is safe."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: bytes):
+        if not isinstance(value, (bytes, bytearray)) or len(value) < 16:
+            raise ValueError("signing_key must be at least 16 bytes")
+        self.value = bytes(value)
+
+    def __repr__(self) -> str:
+        return "<hidden>"
+
+    __str__ = __repr__
+
+
+def _hmac(key: bytes, fields: Dict[str, Any]) -> str:
+    message = json.dumps(fields, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hmac.new(key, message, hashlib.sha256).hexdigest()
 
 
 class AuditLedger:

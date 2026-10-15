@@ -106,6 +106,11 @@ class RUN_TOOL_NODE:
         self.audit_ledger = audit_ledger
         # Contract each transaction started with (fallback when the registry has none)
         self._run_contracts: Dict[str, Dict[str, Any]] = {}
+        # Services that need storage or the capability ledger get this run's, if unset
+        if getattr(self.preflight, "storage", "absent") is None:
+            self.preflight.storage = storage
+        if getattr(self.verifier, "capability_service", "absent") is None:
+            self.verifier.capability_service = capability_service
 
     def execute(
         self,
@@ -192,6 +197,18 @@ class RUN_TOOL_NODE:
             # Step 4: Policy evaluation - PolicyDecisionPoint yields signed decision
             policy_decision = self.policy_point.evaluate(action_proposal, ledger_snapshot, contract)
             transaction.policy_decision = self._pd_to_dict(policy_decision)
+            if policy_decision.requires_confirmation:
+                # Lane C: stays PREFLIGHTED until confirm() or decline()
+                self._record(
+                    session, transaction, "confirmation_requested",
+                    TransactionState.PREFLIGHTED.value, TransactionState.PREFLIGHTED.value,
+                    {"decision_id": str(policy_decision.decision_id),
+                     "expires_at": policy_decision.expires_at.isoformat()},
+                )
+                return transaction, PreflightResult(
+                    allowed=False, requires_confirmation=True,
+                    reason="Awaiting explicit confirmation (lane C); call confirm() or decline()",
+                )
             if not policy_decision.approved:
                 self._transition(session, transaction, "policy_denied",
                                  {"reason": policy_decision.reason})
@@ -214,6 +231,62 @@ class RUN_TOOL_NODE:
             raise
         finally:
             session.close()
+
+    def confirm(
+        self, transaction_id: Any, approver_id: str
+    ) -> Tuple[ToolTransaction, PreflightResult]:
+        """
+        Lane C: an approver confirms a transaction waiting in PREFLIGHTED. The policy point
+        issues a signed approval naming the approver, `policy_approved` fires, and steps 5
+        to 9 run. An expired request ends REJECTED.
+
+        Raises:
+            ValueError: unknown transaction, or it is not waiting for confirmation
+        """
+        session = self.storage.get_session()
+        try:
+            transaction, pending = self._pending_confirmation(session, transaction_id)
+            try:
+                decision = self.policy_point.confirm(pending, approver_id)
+            except ValueError as exc:
+                if "expired" not in str(exc):
+                    raise
+                self._transition(session, transaction, "policy_denied",
+                                 {"reason": "Confirmation request expired"})
+                return transaction, PreflightResult(allowed=False, reason="Confirmation request expired")
+            transaction.policy_decision = self._pd_to_dict(decision)
+            self._transition(session, transaction, "policy_approved",
+                             {"decision_id": str(decision.decision_id),
+                              "approver_type": "human", "approver_id": approver_id})
+            contract = self.capability_service.get_contract(
+                transaction.episode_id, self._run_contracts.get(str(transaction.transaction_id), {})
+            )
+            return self._authorize_and_run(session, transaction, decision, contract)
+        finally:
+            session.close()
+
+    def decline(
+        self, transaction_id: Any, approver_id: str, reason: str = "Declined by approver"
+    ) -> Tuple[ToolTransaction, PreflightResult]:
+        """Lane C: an approver declines; the transaction ends REJECTED without dispatch."""
+        session = self.storage.get_session()
+        try:
+            transaction, _ = self._pending_confirmation(session, transaction_id)
+            self._transition(session, transaction, "policy_denied",
+                             {"reason": reason, "approver_type": "human", "approver_id": approver_id})
+            return transaction, PreflightResult(allowed=False, reason=reason)
+        finally:
+            session.close()
+
+    def _pending_confirmation(self, session, transaction_id: Any) -> Tuple[ToolTransaction, PolicyDecision]:
+        row = self.storage.get_transaction(session, str(transaction_id))
+        if row is None:
+            raise ValueError(f"Unknown transaction {transaction_id}")
+        transaction = self._tx_from_row(row)
+        pending = transaction.policy_decision or {}
+        if transaction.state != TransactionState.PREFLIGHTED or not pending.get("requires_confirmation"):
+            raise ValueError(f"Transaction {transaction_id} is not waiting for confirmation")
+        return transaction, self._pd_from_dict(pending)
 
     # Steps 5 to 9 (shared with flows that authorize later, e.g. explicit confirmation)
 
@@ -242,6 +315,7 @@ class RUN_TOOL_NODE:
             # Step 7: Dispatch - invoke tool via ToolAdapter/connector boundary
             self._transition(session, transaction, "dispatch_started",
                              {"lease_token_hash": _sha(lease.lease_token)})
+            self.capability_service.consume_quota(transaction.tenant_id, transaction.tool_id)
             try:
                 raw_result = to_raw_result(self._dispatch(transaction))
             except TimeoutError as exc:
@@ -654,7 +728,29 @@ class RUN_TOOL_NODE:
             "expires_at": pd.expires_at.isoformat(),
             "approver_type": pd.approver_type,
             "approver_id": pd.approver_id,
+            "lane": pd.lane,
+            "requires_confirmation": pd.requires_confirmation,
         }
+
+    def _pd_from_dict(self, data: Dict[str, Any]) -> PolicyDecision:
+        """Rebuild a PolicyDecision stored with _pd_to_dict."""
+        return PolicyDecision(
+            decision_id=UUID(data["decision_id"]),
+            approved=data["approved"],
+            reason=data["reason"],
+            subject_type=data["subject_type"],
+            subject_ref=data["subject_ref"],
+            contract_hash=data["contract_hash"],
+            ledger_hash=data["ledger_hash"],
+            evidence_refs=list(data.get("evidence_refs", [])),
+            checks=dict(data.get("checks", {})),
+            signature=data.get("signature", ""),
+            expires_at=datetime.fromisoformat(data["expires_at"]),
+            approver_type=data.get("approver_type", ""),
+            approver_id=data.get("approver_id", ""),
+            lane=data.get("lane", ""),
+            requires_confirmation=data.get("requires_confirmation", False),
+        )
 
     def _cd_to_dict(self, cd: CommitDecision) -> Dict[str, Any]:
         """Convert CommitDecision to dict for storage."""

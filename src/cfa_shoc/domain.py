@@ -109,6 +109,7 @@ class PreflightResult:
     reason: Optional[str] = None
     checks_performed: List[str] = field(default_factory=list)
     failures: List[str] = field(default_factory=list)
+    requires_confirmation: bool = False  # lane C: waiting for an explicit approver
 
 
 @dataclass
@@ -127,6 +128,21 @@ class PolicyDecision:
     expires_at: datetime = field(default_factory=utcnow)
     approver_type: str = "system"
     approver_id: str = ""
+    lane: str = ""  # "A" automatic, "B" pre-authorized in contract, "C" explicit confirmation
+    requires_confirmation: bool = False
+
+
+RISK_ORDER = {
+    RiskClass.LOW: 0,
+    RiskClass.MEDIUM: 1,
+    RiskClass.HIGH: 2,
+    RiskClass.CRITICAL: 3,
+}
+
+
+def risk_at_most(risk: Any, cap: Any) -> bool:
+    """True when `risk` is no higher than `cap` (both RiskClass or their string values)."""
+    return RISK_ORDER[RiskClass(risk)] <= RISK_ORDER[RiskClass(cap)]
 
 
 @dataclass

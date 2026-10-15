@@ -241,6 +241,16 @@ class StorageManager:
             query = query.filter(ToolTransactionORM.state.in_(list(states)))
         return query.order_by(ToolTransactionORM.created_at).all()
 
+    def find_in_flight(
+        self, session: Session, tenant_id: str, tool_id: str, states: list
+    ) -> list[ToolTransactionORM]:
+        """Transactions of a tenant on a tool that are in one of the given states."""
+        return session.query(ToolTransactionORM).filter(
+            ToolTransactionORM.tenant_id == tenant_id,
+            ToolTransactionORM.tool_id == tool_id,
+            ToolTransactionORM.state.in_(list(states)),
+        ).all()
+
     def get_transaction(self, session: Session, transaction_id: str) -> Optional[ToolTransactionORM]:
         """Retrieve a transaction by ID."""
         return session.query(ToolTransactionORM).filter(
