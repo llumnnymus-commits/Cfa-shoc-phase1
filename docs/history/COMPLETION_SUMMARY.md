@@ -1,3 +1,5 @@
+> **Historical, contains claims that were false when written; see README.**
+
 # CFA-SHOC Phase 1 Implementation - Completion Summary
 
 ## Overview

@@ -13,10 +13,11 @@ prove it with CI, then release it so it can be sold (see `docs/SALES_PLAYBOOK.md
 2. `HANDOFF_FOR_CLAUDE_CODE.md` (written 2026-10-15 after byte-exact extraction and test runs).
 3. `docs/DRXIT_BATON_SPEC.md`, `docs/PROVENANCE_SPEC.md`.
 4. The spec PDFs "CFA-SHOC v0.2" and "Phase 1 Implementation Addendum" if present in `docs/spec/`.
-5. `HANDOFF.md` (repo's own, 2026-09-30): accurate list of defects, keep it.
-6. `README.md`, `PROJECT_STATE.md`, `MEMORY.md`, `QUICKSTART.md`, `COMPLETION_SUMMARY.md`:
-   **contain false claims** ("70+ tests, all passing", "production-ready", "22 transitions").
-   Do not repeat any claim from them. Rewrite them in work step 12.
+5. `docs/history/HANDOFF.md` (repo's own, 2026-09-30): accurate list of defects, keep it.
+6. `docs/history/` (old `PROJECT_STATE.md`, `MEMORY.md`, `QUICKSTART.md`,
+   `COMPLETION_SUMMARY.md`, `HANDOFF.md`): **contain false claims** ("70+ tests, all passing",
+   "production-ready", "22 transitions"). Do not repeat any claim from them. The README was
+   rewritten in work step 12; every claim in it links to a test.
 
 ## Owner rules (non-negotiable)
 - The owner works from an Android phone only and is not a programmer. Every instruction you

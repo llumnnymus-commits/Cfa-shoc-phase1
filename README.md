@@ -1,447 +1,144 @@
-# CFA-SHOC Phase 1: Deterministic Control Shell for Agent Execution
+# CFA-SHOC
 
-**Capability-Factual, Stateful Hybrid Orchestration and Cognition**
+[![CI](https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/workflows/ci.yml/badge.svg)](https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/workflows/ci.yml)
 
-A deterministic control shell around a probabilistic proposal engine for governed agent execution. Enforces strict guarantees on transaction consistency, auditability, and state management.
+**A transaction layer for AI agent tool calls.** Each tool call an agent proposes becomes a
+transaction. It must pass preflight checks, a signed policy decision, a dispatch lease and
+result verification before a commit gate accepts it. Every step is recorded in a
+hash-chained audit trail. A committed call can be exported as a signed provenance
+certificate that anyone can verify offline.
 
-## What This System Does
+It **produces audit evidence**. It does not make anyone compliant with any law or standard.
 
-CFA-SHOC Phase 1 wraps agentic tool invocation with a robust transaction framework that guarantees:
+Status: version 0.1.0 (alpha). CI builds and tests it on Python 3.11, 3.12 and 3.13. It is
+**not yet published to PyPI**.
 
-### Core Guarantees
+## Why
 
-1. **No Unregistered Tool Dispatch** - Tools must be registered in current capability snapshot before invocation
-2. **No Stale Ledger Operations** - Every proposal created against a specific ledger snapshot, enabling rollback detection
-3. **No Duplicate Side Effects** - Dispatch leases prevent concurrent invocations of same transaction
-4. **Deterministic State Machine** - 13 legally defined states with explicit transitions; impossible to reach COMMITTED without going through VERIFIED
-5. **Tamper-Evident Audit Trail** - Hash-chained append-only event ledger detects any manipulation
-6. **Idempotent Retries** - Same proposal with same idempotency key produces single side effect
-7. **Policy-Driven Authorization** - 3-tier approval lanes (automatic/user/explicit) balancing control and usability
-8. **Result Verification** - Signature validation and schema conformance checking before commit
-
-## Architecture
-
-### Transaction Lifecycle (RUN_TOOL_NODE Protocol)
+An agent that sends email, moves money, edits files or writes to a database needs more than
+a function call. You need to know what it was allowed to do, what it actually did, whether
+the result was checked, and proof that nobody edited the record afterwards. CFA-SHOC puts a
+deterministic state machine between the model's proposal and the tool:
 
 ```
-1. Ledger Refresh
-   ↓
-2. Proposal Normalization (ActionProposal)
-   ↓
-3. Preflight Check (8 deterministic checks)
-   ↓
-4. Policy Evaluation (3-lane approval)
-   ↓
-5. Authorization (verify policy signature & expiry)
-   ↓
-6. Lease Acquisition (idempotency lock)
-   ↓
-7. Dispatch (tool invocation)
-   ↓
-8. Result Verification (signature & schema)
-   ↓
-9. Commit (persist to durable state)
+PROPOSED -> PREFLIGHTED -> AUTHORIZED -> DISPATCHED -> RETURNED -> VERIFIED -> COMMITTED
+               |               |             |  \                     |
+            REJECTED        REJECTED      FAILED  PENDING_EXTERNAL / UNKNOWN -> reconcile,
+                                                   or COMPENSATION_REQUIRED -> COMPENSATED
 ```
 
-### 13-State Transaction Machine
+14 states and 24 legal transitions. Nothing can reach COMMITTED without passing through
+VERIFIED and the commit gate.
 
-```
-PROPOSED
-├─ preflight_passed → PREFLIGHTED
-└─ preflight_failed → REJECTED
-
-PREFLIGHTED
-├─ policy_approved → AUTHORIZED
-└─ policy_denied → REJECTED
-
-AUTHORIZED
-└─ dispatch_started → DISPATCHED
-
-DISPATCHED
-├─ response_received → RETURNED
-├─ async_accepted → PENDING_EXTERNAL
-├─ deadline_exceeded → UNKNOWN
-└─ connector_error → FAILED
-
-RETURNED
-├─ verification_passed → VERIFIED
-└─ verification_failed → FAILED
-
-PENDING_EXTERNAL
-├─ status_succeeded → VERIFIED
-├─ status_failed → FAILED
-└─ status_unknown → UNKNOWN
-
-VERIFIED
-├─ action_commit_approved → COMMITTED
-└─ action_commit_denied → REJECTED
-
-UNKNOWN
-├─ reconcile_succeeded → VERIFIED
-├─ reconcile_failed → FAILED
-└─ compensation_required → COMPENSATION_REQUIRED
-
-COMMITTED
-├─ compensation_succeeded → COMPENSATED
-└─ compensation_failed → COMPENSATION_FAILED
-
-Terminal States: COMMITTED, COMPENSATED, COMPENSATION_FAILED, FAILED, REJECTED
-```
-
-### Service Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│           RUN_TOOL_NODE Orchestrator                │
-├─────────────────────────────────────────────────────┤
-├─ CapabilitySnapshotService (ledger management)
-├─ ActionNormalizer (proposal validation)
-├─ PreflightService (8 deterministic checks)
-├─ PolicyDecisionPoint (3-lane approval)
-├─ TransactionCoordinator (state machine)
-├─ ToolAdapter (credential isolation)
-├─ ResultVerifier (result validation)
-├─ CommitMembrane (commit enforcement)
-├─ AuditLedger (tamper-evident logging)
-└─ ReconciliationWorker (async/timeout handling)
-```
-
-## Quick Start
-
-### Installation
-
-```bash
-# Clone repository
-cd cfa-shoc-phase1
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate
-
-# Install dependencies
-pip install -e ".[dev]"
-```
-
-### Running Tests
-
-```bash
-# Run all tests
-pytest
-
-# Run specific category
-pytest -m unit           # Unit tests
-pytest -m integration    # Integration tests  
-pytest -m chaos         # Chaos tests
-
-# Run with coverage
-pytest --cov=src tests/
-
-# Run specific test file
-pytest tests/test_orchestration.py -v
-```
-
-### Using the Orchestrator
+## Quick example
 
 ```python
-from src.orchestrator import RUN_TOOL_NODE, OrchestrationContext
-from src.storage import StorageManager
-from src.services import (
-    CapabilitySnapshotService, ActionNormalizer, PreflightService,
-    PolicyDecisionPoint, ToolAdapter, ResultVerifier, CommitMembrane,
-    AuditLedger,
+from uuid import uuid4
+from cfa_shoc import (
+    ActionNormalizer, AuditLedger, CapabilitySnapshotService, CommitMembrane, OrchestrationContext,
+    PolicyDecisionPoint, PreflightService, ResultVerifier, RUN_TOOL_NODE, StorageManager, ToolAdapter,
 )
 
-# Setup storage
-storage = StorageManager("sqlite:///transactions.db")
+storage = StorageManager("sqlite:///:memory:")
 storage.init_db()
+ledger = CapabilitySnapshotService()
+ledger.update_tool_state("tool_echo", {"id": "tool_echo"})  # the tool exists in the ledger
+tools = ToolAdapter()
+tools.register("tool_echo", lambda req: {"status": "succeeded", "output": {"echo": req.arguments["message"]}})
 
-# Create services
-capability_service = CapabilitySnapshotService()
-normalizer = ActionNormalizer()
-preflight = PreflightService()
-policy = PolicyDecisionPoint()
-adapter = ToolAdapter()
-verifier = ResultVerifier()
-commit = CommitMembrane()
-audit = AuditLedger()
+run = RUN_TOOL_NODE(storage, ledger, ActionNormalizer(ledger), PreflightService(ledger),
+                    PolicyDecisionPoint(), tools, ResultVerifier(), CommitMembrane(), AuditLedger())
+ctx = OrchestrationContext(uuid4(), uuid4(), uuid4(), principal_id="me", tenant_id="t1", requested_by="model")
 
-# Create orchestrator
-orchestrator = RUN_TOOL_NODE(
-    storage=storage,
-    capability_service=capability_service,
-    normalizer=normalizer,
-    preflight=preflight,
-    policy_point=policy,
-    tool_adapter=adapter,
-    verifier=verifier,
-    commit_membrane=commit,
-    audit_ledger=audit,
-)
-
-# Execute transaction
-context = OrchestrationContext(
-    proposal_id=uuid4(),
-    episode_id=uuid4(),
-    task_node_id=uuid4(),
-    principal_id="user_123",
-    tenant_id="tenant_456",
-    requested_by="user",
-)
-
-model_proposal = {
-    "tool_id": "tool_echo",
-    "operation": "echo",
-    "arguments": {"message": "hello"},
-    "risk_class": "low",
-    "side_effect_class": "none",
-}
-
-transaction, result = orchestrator.execute(model_proposal, context)
-print(f"Transaction state: {transaction.state}")
-print(f"Result allowed: {result.allowed}")
+tx, result = run.execute({"tool_id": "tool_echo", "operation": "echo",
+                          "arguments": {"message": "hi"}, "risk_class": "low"}, ctx)
+print(tx.state.value, "-", result.reason)      # COMMITTED - Transaction committed successfully
+print(storage.verify_chain(tx.transaction_id))  # (True, None)
 ```
 
-## Project Layout
+[`tests/test_readme.py`](tests/test_readme.py) runs this exact block in CI. The full demo,
+[`examples/demo_echo.py`](examples/demo_echo.py), runs as its own CI job. It shows an approved
+call, a denied call, a human-confirmed call, the audit trail, chain verification and a
+provenance certificate.
 
-```
-cfa-shoc-phase1/
-├── src/
-│   ├── domain.py          # Core dataclasses (ActionProposal, ToolTransaction, etc.)
-│   ├── state_machine.py   # 13-state transaction machine with invariants
-│   ├── storage.py         # SQLAlchemy ORM and database layer
-│   ├── services.py        # 10 core Phase 1 services
-│   └── orchestrator.py    # RUN_TOOL_NODE orchestration protocol
-├── tests/
-│   ├── test_state_machine.py       # 30+ state machine tests
-│   ├── test_orchestration.py       # 20+ integration tests
-│   └── test_chaos_and_properties.py # 20+ chaos/property tests
-├── pyproject.toml         # Project metadata and dependencies
-├── pytest.ini             # Pytest configuration
-├── PROJECT_STATE.md       # Detailed project status
-└── README.md             # This file
-```
+## Guarantees, and the test that proves each one
 
-## Key Concepts
+| Guarantee | Proven by |
+|---|---|
+| An unregistered tool is refused before any dispatch | [`test_orchestrator_flow.py::test_unregistered_tool_is_refused_before_dispatch`](tests/test_orchestrator_flow.py) |
+| A call the policy denies never reaches the tool | [`test_orchestrator_flow.py::test_medium_risk_call_is_rejected_by_policy_and_never_dispatched`](tests/test_orchestrator_flow.py) |
+| A forged or expired policy decision is revoked before dispatch | [`test_real_checks.py::test_forged_policy_decision_is_revoked_before_dispatch`](tests/test_real_checks.py), [`::test_expired_policy_decision_is_revoked_before_dispatch`](tests/test_real_checks.py) |
+| Policy and commit decisions are HMAC-signed; tampering is detected | [`test_real_checks.py::TestPolicySignatures`](tests/test_real_checks.py), [`::TestCommitSignatures`](tests/test_real_checks.py) |
+| No path reaches COMMITTED except through VERIFIED and the commit gate | [`test_chaos_and_properties.py::test_property_no_state_jump_to_committed`](tests/test_chaos_and_properties.py), [`test_real_checks.py::TestCommitSignatures::test_gate_refuses_unverified_transaction`](tests/test_real_checks.py) |
+| No transaction can get stuck: every non-terminal state has an exit | [`test_state_machine.py::TestStepThreeTransitions::test_every_non_terminal_state_has_an_exit`](tests/test_state_machine.py) |
+| A commit is refused if the capability ledger or the contract changed after authorization | [`test_orchestrator_flow.py::test_ledger_change_during_dispatch_blocks_commit`](tests/test_orchestrator_flow.py), [`::test_contract_change_during_dispatch_blocks_commit`](tests/test_orchestrator_flow.py) |
+| Each state change and its audit event are stored together; the stored state always equals the in-memory state | [`test_orchestrator_flow.py::test_durable_state_matches_memory_after_every_scenario`](tests/test_orchestrator_flow.py) |
+| The stored audit trail is hash-chained per transaction; editing, deleting or re-hashing an event is detected at its index | [`test_audit_and_reconcile.py::test_editing_a_stored_payload_is_detected`](tests/test_audit_and_reconcile.py), [`::test_deleting_an_event_is_detected`](tests/test_audit_and_reconcile.py), [`::test_recomputing_an_edited_hash_breaks_the_next_link`](tests/test_audit_and_reconcile.py) |
+| Retrying a committed call with the same idempotency key returns the original transaction without dispatching again | [`test_orchestration.py::TestConcurrency::test_duplicate_proposal_uses_same_transaction`](tests/test_orchestration.py) |
+| A second call with the same idempotency key is refused while the first is in flight | [`test_real_checks.py::test_same_idempotency_key_in_flight_conflicts`](tests/test_real_checks.py) |
+| Arguments and outputs are validated against the tool's declared schemas | [`test_real_checks.py::test_schema_check_rejects_bad_arguments`](tests/test_real_checks.py), [`::TestResultVerifier::test_output_schema_enforced`](tests/test_real_checks.py) |
+| Per-tenant quotas and contract risk caps are enforced in preflight | [`test_real_checks.py::test_quota_exhausted_is_rejected_before_dispatch`](tests/test_real_checks.py), [`::test_risk_above_contract_max_risk_is_rejected`](tests/test_real_checks.py) |
+| Risky calls can require a named human approver (lane C); nothing is dispatched before confirmation | [`test_real_checks.py::test_lane_c_waits_in_preflighted_without_dispatch`](tests/test_real_checks.py), [`::test_lane_c_confirm_commits_with_named_approver`](tests/test_real_checks.py) |
+| A timeout is recorded as UNKNOWN, never as success; reconciliation settles it with the provider | [`test_orchestrator_flow.py::test_timeout_ends_unknown`](tests/test_orchestrator_flow.py), [`test_audit_and_reconcile.py::test_unknown_succeeded_commits`](tests/test_audit_and_reconcile.py) |
+| A possible side effect with an unknown outcome leads to compensation, not silence | [`test_audit_and_reconcile.py::test_unknown_with_side_effect_requires_then_gets_compensation`](tests/test_audit_and_reconcile.py) |
+| A provenance certificate verifies offline; any edit to it, or to the stored events, is detected | [`test_provenance.py`](tests/test_provenance.py) (spec acceptance tests 1 to 7) |
+| Agent-to-agent handoffs (DRxit batons) fail closed when unsupported, unsigned, contradictory or missing evidence | [`test_baton.py`](tests/test_baton.py) (spec acceptance tests 1 to 9) |
 
-### ActionProposal
+## Concepts
 
-Canonical action from probabilistic engine, normalized to:
-- Never contains credentials or direct connector clients
-- Typed tool_id, operation, arguments
-- Risk/side-effect classification
-- Idempotency key for deduplication
+- **Capability ledger** (`CapabilitySnapshotService`): the tools, connectors, quotas and
+  policies that exist right now. Its hash covers content only, so it changes only when the
+  content changes.
+- **Contract** (`OrchestrationContext.contract`): what this episode may do: `scopes`,
+  `max_risk`, `pre_authorized` entries (lane B) and `confirm_up_to` (lane C).
+- **Policy lanes**: A, automatic (low risk, no lasting side effect); B, pre-authorized in the
+  contract; C, explicit confirmation by a named approver. Everything else is denied.
+- **Commit gate** (`CommitMembrane`): re-reads the ledger and the contract at commit time and
+  refuses if either changed, or if the result was not verified.
+- **Audit trail**: `StorageManager.verify_chain(tx_id)` returns `(ok, first_bad_index)`.
+- **Reconciliation**: `ReconciliationWorker(..., orchestrator).run_once()` settles UNKNOWN,
+  PENDING_EXTERNAL and COMPENSATION_REQUIRED transactions.
+- **Provenance**: `cfa_shoc.provenance.issue_certificate(...)`, then
+  `cfa-shoc verify cert.json --trust did:key:...` (needs the `[provenance]` extra).
+- **DRxit batons**: `cfa_shoc.baton.seal / validate / acknowledge / retire / chain`, for
+  signed handoffs between legs of a long agent job ([spec](docs/DRXIT_BATON_SPEC.md)).
 
-### Transaction State Machine
+## Limits (read before relying on it)
 
-Enforces legal state progression with no shortcuts:
-- PROPOSED → PREFLIGHTED → AUTHORIZED → DISPATCHED → VERIFIED → COMMITTED
-- All states must be visited in order (except error paths)
-- Impossible to reach COMMITTED without going through VERIFIED
-- Terminal states prevent further transitions
+- **Alpha.** Tested with SQLite only. PostgreSQL is supported through SQLAlchemy but not tested
+  in CI.
+- **Single process.** Quota usage counters live in memory per `CapabilitySnapshotService`.
+  Dispatch leases are checked by a database query, not by row locks, and concurrent writers
+  across processes have not been tested.
+- **Keys.** Policy and commit decisions use HMAC-SHA256. Without a `signing_key`, each process
+  makes a random key, so its decisions verify only within that process. Pass keys explicitly
+  if decisions must be checked elsewhere.
+- **Tool results are not signed** by tools in this version. `ResultVerifier` checks status,
+  schema, tool/connector match and idempotency echo, and reports `signature_valid=False`.
+- **Certificates** use the spec's source form: an Ed25519 signature over the JCS-canonical
+  `credentialSubject`, with a `did:key` issuer. They are VC-shaped and verifiable with this
+  library. They are not claimed to verify with generic Verifiable Credential tooling;
+  `eddsa-jcs-2022` is future work.
+- **Audit chain anchor.** Rewriting the *last* stored event together with its hash cannot be
+  detected from the database alone. A provenance certificate issued earlier is the external
+  anchor that exposes it.
+- **Schema validation** supports a subset of JSON Schema (type, required, properties,
+  additionalProperties false, enum, length and range limits, items, maxItems).
+- The API is synchronous.
 
-### Preflight Checks (8)
+## Install and develop
 
-1. **Ledger Currency**: Snapshot sequence matches current state
-2. **Tool Available**: Tool registered in current snapshot
-3. **Connector Healthy**: Connector connected and operational
-4. **Scopes Valid**: Principal has required scopes
-5. **Schema Valid**: Arguments match tool schema
-6. **Quota Available**: Principal under quota
-7. **Risk Policy**: Proposal risk level allowed
-8. **No Conflict**: No active lease for this transaction
+From a checkout: `pip install -e ".[dev]"`, then `pytest`. CI does exactly this on every push
+([workflow](.github/workflows/ci.yml)). Runtime dependency: SQLAlchemy. Optional:
+`cryptography` for provenance (`[provenance]` extra).
 
-### Policy Decision Lanes
+## History
 
-- **Lane A (Automatic)**: Low-risk, reversible, deterministic → auto-approved
-- **Lane B (User-Authorized)**: Pre-configured in contract → approved if matches
-- **Lane C (Explicit Confirmation)**: High-risk → requires explicit approval
-
-### Dispatch Lease
-
-Short-lived mutex preventing concurrent invocation of same transaction:
-- Acquired at AUTHORIZED state
-- Held until result verified
-- Released on success or error
-- Expires after 5 minutes (prevents deadlock)
-
-### Observation Envelope
-
-Result wrapper providing security properties:
-- source_class: "tool_output"
-- authority_level: "non_authoritative_content"
-- content: Raw tool result
-- integrity_signature: Hash for tamper detection
-
-## Testing
-
-Phase 1 includes 70+ tests covering:
-
-### Unit Tests (30+)
-- State machine transitions (22 transitions, prohibited paths)
-- Terminal state enforcement
-- Invariant validation (6 invariants)
-- Error handling
-
-### Integration Tests (20+)
-- Full transaction lifecycle (proposal → commit)
-- Service coordination
-- Error scenarios and rollback
-- Concurrent access handling
-
-### Chaos & Property Tests (20+)
-- Storage failures and fault injection
-- Concurrent lease conflicts
-- Property invariants (no unregistered dispatch, no double dispatch, etc.)
-- Boundary conditions and edge cases
-
-## Specification
-
-This implementation follows:
-- **CFA-SHOC v0.2**: Complete architecture and design (36 pages)
-- **Phase 1 Implementation Addendum**: Concrete execution pseudocode and examples (22 pages)
-
-Key sections implemented:
-- Section 3.2: Transaction state machine with legal transitions
-- Section 3.3: Transaction invariants and enforcement
-- Section 13: Concrete Phase 1 execution pseudocode (RUN_TOOL_NODE)
-
-## Development
-
-### Code Quality
-
-```bash
-# Format code
-black src/ tests/
-
-# Lint code
-ruff check src/ tests/
-
-# Type checking
-mypy src/
-
-# Run tests with coverage
-pytest --cov=src --cov-report=html
-```
-
-### Development Workflow
-
-1. **Create feature branch**: `git checkout -b feature/new-feature`
-2. **Implement feature** with tests
-3. **Run all checks**: `black . && ruff check . && mypy src/ && pytest`
-4. **Commit with clear message**: `git commit -m "Add new feature"`
-5. **Push and create PR**
-
-### Adding New Services
-
-1. Define interface in service
-2. Create ORM model if persistent storage needed
-3. Implement service class with clear methods
-4. Add unit tests for service methods
-5. Add integration tests for orchestrator interaction
-6. Update orchestrator if needed
-
-## Next Steps
-
-### Phase 1 Completion
-- [ ] API endpoints for transaction submission
-- [ ] Database migrations for PostgreSQL
-- [ ] OpenTelemetry instrumentation
-- [ ] Timeout recovery and async polling
-- [ ] Manual reconciliation operator tools
-
-### Phase 2
-- [ ] Multi-step transaction composition
-- [ ] Complex compensation strategies
-- [ ] Advanced policy rule engine
-- [ ] Performance optimization
-- [ ] Distributed deployment support
-
-## Architecture Decisions
-
-### Why 13 States?
-
-The state machine captures all meaningful points in the transaction lifecycle:
-- **Proposal Phase**: PROPOSED
-- **Validation Phase**: PREFLIGHTED
-- **Authorization Phase**: AUTHORIZED
-- **Execution Phase**: DISPATCHED, RETURNED, PENDING_EXTERNAL
-- **Verification Phase**: VERIFIED
-- **Commit Phase**: COMMITTED
-- **Error/Recovery Phase**: UNKNOWN, FAILED, REJECTED, COMPENSATION_REQUIRED, COMPENSATED, COMPENSATION_FAILED
-
-### Why Dispatch Leases?
-
-Prevent duplicate side effects when:
-- Network timeouts cause retries
-- Duplicate proposals with same idempotency key
-- Concurrent execution of same operation
-
-### Why Hash-Chained Audit?
-
-Provide tamper evidence:
-- Each event includes hash of previous event
-- Detecting modification anywhere breaks chain
-- Immutable audit trail for regulatory compliance
-
-### Why 3-Lane Policy?
-
-Balance automation and control:
-- **Lane A**: Usable for safe operations
-- **Lane B**: Scales manual approval (pre-configured)
-- **Lane C**: Explicit consent for risky operations
-
-## Performance Characteristics
-
-**Transaction Overhead**:
-- Ledger refresh: ~1-5ms (network bound)
-- Preflight checks: ~5-10ms (deterministic)
-- Policy evaluation: ~10-50ms (depends on policy complexity)
-- Lease acquisition: ~1-5ms (database)
-- Dispatch: 0-X (tool dependent)
-- Verification: ~5-20ms (signature validation)
-- Commit: ~5-20ms (database)
-
-**Total Framework Overhead**: ~35-150ms (before tool execution)
-
-## Security Considerations
-
-- **Credential Isolation**: Credentials never appear in proposal state or logs
-- **Signature Validation**: Results verified before commit
-- **Schema Enforcement**: Prevents malformed results
-- **Audit Trail**: Hash-chained events detect tampering
-- **Idempotency**: Prevents duplicate side effects
-- **Policy Framework**: Restricts high-risk operations
-- **Scope Validation**: Principal authorization checks
-
-## Troubleshooting
-
-### Transaction in UNKNOWN state
-
-Indicates dispatch was sent but response not received within deadline:
-- Check connector logs
-- Query provider for operation status
-- Use reconciliation worker to recover
-
-### Policy decision denied
-
-Check:
-- Risk classification of proposal
-- Principal's policy contract
-- Required scopes for operation
-- Approval lane requirements
-
-### Lease acquisition timeout
-
-Indicates concurrent execution:
-- Check if previous invocation still in progress
-- Verify lease expiration (default 5 min)
-- May need retry backoff in client
+The files in [`docs/history/`](docs/history/) are from before this rewrite. They contain
+claims that were false when written ("production-ready", "70+ tests, all passing"). The
+inherited code did not import. What was fixed, and why, is in [`DECISIONS.md`](DECISIONS.md)
+and [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 
-MIT
-
-## Questions & Support
-
-See PROJECT_STATE.md for detailed architecture documentation.
-Contact: [maintainer email]
+MIT, see [`LICENSE`](LICENSE).

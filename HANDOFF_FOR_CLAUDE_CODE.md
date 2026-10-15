@@ -368,12 +368,12 @@ an owner question before it goes live.
 | 5 Orchestrator | done | test_orchestrator_flow 14 passed; commit 261a4a7; green from step 6 CI |
 | 6 Tests | done | first green CI, 98 tests on 3.11/3.12/3.13: https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38724320439 (commit 0154b0e) |
 | 7 Packaging | done | CI green incl. wheel install + version 0.1.0: https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38724620489 (commit 0c88bbd) |
-| 8 Real checks | done (CI pending) | 151 passed on 3.11/3.12/3.13 in session; run https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38725147586 (commit f7368f4) |
-| 9 Audit and reconcile | pending | |
-| 10 Baton | pending | |
-| 11 Provenance | pending | |
-| 12 Demo and docs | pending | |
+| 8 Real checks | done | CI green: https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38725147586 (commit f7368f4) |
+| 9 Audit and reconcile | done | CI green: https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38725647866 (commit e4b0f7e) |
+| 10 Baton | done | spec tests 1-9 pass; CI green: https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38725981928 (commit bcdeb91) |
+| 11 Provenance | done | spec tests 1-7 pass in session (211 total on 3 Pythons); CI run https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38726301961 (commit 4be475c) |
+| 12 Demo and docs | done (CI pending) | demo prints DEMO OK in session; 214 passed on 3 Pythons; see PROJECT_STATE_VERIFIED.md for the run |
 | 13 Release | pending (owner question) | |
 | 14 Sales assets | pending (owner question per listing) | |
 
-**Next action:** Step 9 (durable audit chain + reconciliation worker).
+**Next action:** Step 13 owner question (public repo + MIT + PyPI release), asked once with the recommended default.
