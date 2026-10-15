@@ -82,6 +82,10 @@ class RUN_TOOL_NODE:
     together with its audit event in one database transaction.
     """
 
+    # How long reconciliation keeps asking the provider before giving up on an outcome
+    RECONCILE_WINDOW = timedelta(hours=1)
+    ASYNC_WINDOW = timedelta(hours=24)
+
     def __init__(
         self,
         storage: StorageManager,
@@ -222,12 +226,11 @@ class RUN_TOOL_NODE:
 
         except Exception as e:
             session.rollback()
-            if transaction is not None:
-                event = self._make_event(
-                    transaction, "orchestration_error", None, None,
+            if transaction is not None and not isinstance(e, IllegalTransitionError):
+                self._record_best_effort(
+                    transaction, "orchestration_error",
                     {"error": str(e), "exception_type": type(e).__name__},
                 )
-                self.audit_ledger.append(event)
             raise
         finally:
             session.close()
@@ -278,6 +281,111 @@ class RUN_TOOL_NODE:
         finally:
             session.close()
 
+    def reconcile(
+        self, transaction_id: Any, now: Optional[datetime] = None
+    ) -> Tuple[ToolTransaction, str]:
+        """
+        Move one UNKNOWN, PENDING_EXTERNAL, COMPENSATION_REQUIRED or stuck DISPATCHED
+        transaction forward using the provider's answer. Returns (transaction, action),
+        where action is the event fired or "wait:<why>" when nothing could be decided yet.
+
+        Provider "succeeded" -> verify, VERIFIED, then commit through the action gate.
+        Provider "failed"    -> FAILED.
+        Provider "unknown"   -> wait until the deadline; then PENDING_EXTERNAL -> UNKNOWN,
+                                and UNKNOWN -> FAILED (no side effect) or
+                                COMPENSATION_REQUIRED (side effect possible).
+        COMPENSATION_REQUIRED -> the tool's compensator decides COMPENSATED or
+                                COMPENSATION_FAILED; without one a human must act.
+        """
+        now = now or utcnow()
+        session = self.storage.get_session()
+        try:
+            row = self.storage.get_transaction(session, str(transaction_id))
+            if row is None:
+                raise ValueError(f"Unknown transaction {transaction_id}")
+            transaction = self._tx_from_row(row)
+            state = transaction.state
+
+            if state == TransactionState.DISPATCHED:
+                if self.storage.has_live_lease(session, str(transaction.transaction_id)):
+                    return transaction, "wait:dispatch in progress"
+                transaction.deadline_at = now + self.RECONCILE_WINDOW
+                self._transition(session, transaction, "deadline_exceeded",
+                                 {"reason": "Dispatch lease expired without a recorded outcome"})
+                return transaction, "deadline_exceeded"
+
+            if state == TransactionState.COMPENSATION_REQUIRED:
+                outcome = self.tool_adapter.compensate(
+                    transaction.tool_id, transaction.transaction_id, transaction.external_operation_id
+                )
+                if outcome is None:
+                    return transaction, "wait:no compensator registered, needs a human"
+                event = "compensation_succeeded" if outcome == "succeeded" else "compensation_failed"
+                self._transition(session, transaction, event, {"compensator_outcome": outcome})
+                return transaction, event
+
+            if state not in (TransactionState.PENDING_EXTERNAL, TransactionState.UNKNOWN):
+                return transaction, f"wait:not reconcilable in state {state.value}"
+
+            pending = state == TransactionState.PENDING_EXTERNAL
+            if transaction.external_operation_id:
+                status = self.tool_adapter.query_status(
+                    transaction.tool_id, transaction.external_operation_id
+                )
+            else:
+                status = {"status": "unknown", "result": None}
+            answer = status.get("status", "unknown")
+
+            if answer == "succeeded":
+                raw = to_raw_result({
+                    "transport_status": "ok",
+                    "tool_id": status.get("tool_id"),
+                    "connector_id": transaction.connector_id,
+                    "output": status.get("result"),
+                    "external_operation_id": transaction.external_operation_id,
+                    "idempotency_key": status.get("idempotency_key"),
+                })
+                verification = self.verifier.verify(raw, transaction)
+                transaction.verification = self._rv_to_dict(verification)
+                if not verification.passed:
+                    event = "status_failed" if pending else "reconcile_failed"
+                    self._transition(session, transaction, event,
+                                     {"reason": f"Provider result failed verification: {verification.reason}"})
+                    return transaction, event
+                observation = self._observation(transaction, raw, verification)
+                transaction.result_envelope = {"observation": self._oe_to_dict(observation), "verified": True}
+                event = "status_succeeded" if pending else "reconcile_succeeded"
+                self._transition(session, transaction, event,
+                                 {"output_hash": observation.integrity_signature})
+                committed, _ = self._commit(session, transaction, observation)
+                if committed.state == TransactionState.COMMITTED:
+                    return committed, "action_commit_approved"
+                return committed, "action_commit_denied"
+
+            if answer == "failed":
+                event = "status_failed" if pending else "reconcile_failed"
+                self._transition(session, transaction, event, {"reason": "Provider reports failure"})
+                return transaction, event
+
+            # Still unknown
+            deadline = transaction.deadline_at
+            if deadline is not None and now < deadline:
+                return transaction, "wait:provider status unknown, deadline not reached"
+            if pending:
+                transaction.deadline_at = now + self.RECONCILE_WINDOW
+                self._transition(session, transaction, "status_unknown",
+                                 {"reason": "Provider status unknown past the async deadline"})
+                return transaction, "status_unknown"
+            if transaction.side_effect_class in ("", "none"):
+                self._transition(session, transaction, "reconcile_failed",
+                                 {"reason": "Outcome unknown past deadline; no side effect, safe to retry"})
+                return transaction, "reconcile_failed"
+            self._transition(session, transaction, "compensation_required",
+                             {"reason": "Outcome unknown past deadline; side effect possible"})
+            return transaction, "compensation_required"
+        finally:
+            session.close()
+
     def _pending_confirmation(self, session, transaction_id: Any) -> Tuple[ToolTransaction, PolicyDecision]:
         row = self.storage.get_transaction(session, str(transaction_id))
         if row is None:
@@ -320,6 +428,7 @@ class RUN_TOOL_NODE:
                 raw_result = to_raw_result(self._dispatch(transaction))
             except TimeoutError as exc:
                 reason = f"Dispatch deadline exceeded: {exc}"
+                transaction.deadline_at = utcnow() + self.RECONCILE_WINDOW
                 self._transition(session, transaction, "deadline_exceeded", {"reason": reason})
                 return transaction, PreflightResult(allowed=False, reason=reason)
 
@@ -337,7 +446,7 @@ class RUN_TOOL_NODE:
 
             # Asynchronous acceptance: reconciliation finishes the transaction later
             if raw_result.transport_status == "async_accepted":
-                transaction.deadline_at = utcnow() + timedelta(hours=24)
+                transaction.deadline_at = utcnow() + self.ASYNC_WINDOW
                 self._transition(session, transaction, "async_accepted",
                                  {"external_operation_id": transaction.external_operation_id})
                 return transaction, PreflightResult(
@@ -572,10 +681,10 @@ class RUN_TOOL_NODE:
         try:
             next_state, reason = TransactionStateMachine.transition(from_state, event)
         except IllegalTransitionError as e:
-            self.audit_ledger.append(self._make_event(
-                transaction, "illegal_transition_attempt", from_state.value, None,
-                {"error": str(e), "event": event},
-            ))
+            self._record_best_effort(
+                transaction, "illegal_transition_attempt",
+                {"error": str(e), "from_state": from_state.value, "event": event},
+            )
             raise
         transaction.state = next_state
         transaction.updated_at = utcnow()
@@ -597,11 +706,29 @@ class RUN_TOOL_NODE:
         if event_type == "orchestration_started":
             to_state = transaction.state.value
         event = self._make_event(transaction, event_type, from_state, to_state, payload or {})
-        self.audit_ledger.append(event)
-        self.storage.record_transition(
+        row = self.storage.record_transition(
             session, self._tx_to_dict(transaction), self._event_to_dict(event)
         )
+        event.sequence, event.prior_hash, event.event_hash = row.sequence, row.prior_hash, row.event_hash
+        self.audit_ledger.append(event)
         return event
+
+    def _record_best_effort(
+        self, transaction: ToolTransaction, event_type: str, payload: Dict[str, Any]
+    ) -> None:
+        """Store a non-transition event (errors) in its own DB transaction, if possible."""
+        event = self._make_event(transaction, event_type, None, None, payload)
+        session = self.storage.get_session()
+        try:
+            if self.storage.get_transaction(session, str(transaction.transaction_id)) is None:
+                return
+            row = self.storage.append_event(session, self._event_to_dict(event))
+            event.sequence, event.prior_hash, event.event_hash = row.sequence, row.prior_hash, row.event_hash
+            self.audit_ledger.append(event)
+        except Exception:
+            pass  # never mask the original failure
+        finally:
+            session.close()
 
     def _make_event(
         self,
