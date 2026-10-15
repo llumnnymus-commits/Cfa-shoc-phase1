@@ -17,3 +17,13 @@ supersedes an earlier one says so.
   exactly what was inherited. | Commit `3d478cb`.
 
 ## Made during implementation
+- **2026-10-15 | Step 3: TERMINAL vs FINAL.** `TERMINAL_STATES` keeps meaning "no further
+  forward processing" and still includes COMMITTED. New `FINAL_STATES` = terminal states with
+  zero outgoing transitions (all terminal states except COMMITTED). Only
+  `compensation_succeeded` / `compensation_failed` may leave COMMITTED. Added
+  COMPENSATION_REQUIRED -> COMPENSATED / COMPENSATION_FAILED (D3) and AUTHORIZED +
+  `authorization_revoked` -> REJECTED (D4). The table now has 24 transitions. | The two test files
+  contradicted each other (D2), and two states could strand a transaction. | One test changed
+  meaning: `test_terminal_state_prevents_further_transitions` now asserts zero transitions for
+  FINAL_STATES and compensation-only exits for COMMITTED. Not checked against spec section 3.2
+  because the spec PDFs are not in the repo.

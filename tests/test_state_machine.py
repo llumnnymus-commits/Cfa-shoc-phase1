@@ -296,3 +296,54 @@ class TestTransactionInvariants:
         TransactionInvariants.assert_completed_has_display_label(
             TransactionState.FAILED, display_label="failed"
         )
+
+
+class TestStepThreeTransitions:
+    """Transitions added in handoff step 3 (D3, D4) and the FINAL_STATES model (D2)."""
+
+    def test_authorized_to_rejected_on_revocation(self):
+        """AUTHORIZED + authorization_revoked -> REJECTED"""
+        next_state, _ = TransactionStateMachine.transition(
+            TransactionState.AUTHORIZED, "authorization_revoked"
+        )
+        assert next_state == TransactionState.REJECTED
+
+    def test_compensation_required_to_compensated(self):
+        """COMPENSATION_REQUIRED + compensation_succeeded -> COMPENSATED"""
+        next_state, _ = TransactionStateMachine.transition(
+            TransactionState.COMPENSATION_REQUIRED, "compensation_succeeded"
+        )
+        assert next_state == TransactionState.COMPENSATED
+
+    def test_compensation_required_to_compensation_failed(self):
+        """COMPENSATION_REQUIRED + compensation_failed -> COMPENSATION_FAILED"""
+        next_state, _ = TransactionStateMachine.transition(
+            TransactionState.COMPENSATION_REQUIRED, "compensation_failed"
+        )
+        assert next_state == TransactionState.COMPENSATION_FAILED
+
+    def test_policy_denied_illegal_from_authorized(self):
+        """The old orchestrator fired policy_denied from AUTHORIZED; it must stay illegal."""
+        with pytest.raises(IllegalTransitionError):
+            TransactionStateMachine.transition(TransactionState.AUTHORIZED, "policy_denied")
+
+    def test_transition_count(self):
+        """The docstring count matches the table."""
+        assert len(TransactionStateMachine.LEGAL_TRANSITIONS) == 24
+
+    def test_every_non_terminal_state_has_an_exit(self):
+        """No transaction can get stuck: every non-terminal state has an outgoing transition."""
+        for state in TransactionState:
+            if TransactionStateMachine.is_terminal(state):
+                continue
+            assert TransactionStateMachine.get_possible_transitions(state), state
+
+    def test_final_states_have_no_exits(self):
+        """FINAL_STATES = terminal states with zero outgoing transitions."""
+        for state in TransactionStateMachine.FINAL_STATES:
+            assert TransactionStateMachine.get_possible_transitions(state) == set()
+        assert TransactionState.COMMITTED not in TransactionStateMachine.FINAL_STATES
+
+    def test_compensation_required_is_not_terminal(self):
+        """COMPENSATION_REQUIRED is an in-progress state."""
+        assert not TransactionStateMachine.is_terminal(TransactionState.COMPENSATION_REQUIRED)
