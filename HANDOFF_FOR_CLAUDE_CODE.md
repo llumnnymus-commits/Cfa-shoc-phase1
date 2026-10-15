@@ -361,14 +361,14 @@ an owner question before it goes live.
 | Step | State | Evidence (CI run URL / commit) |
 |---|---|---|
 | 0 Place and verify | done | unpack ALL 24 FILES OK; 18/18 hashes match; commit 3d478cb |
-| 1 CI baseline | pending | |
-| 2 Fix D1 | pending (fix proven in sandbox: 33/33) | |
-| 3 State machine | pending | |
-| 4 Domain | pending | |
-| 5 Orchestrator | pending | |
-| 6 Tests | pending | |
-| 7 Packaging | pending | |
-| 8 Real checks | pending | |
+| 1 CI baseline | done | red with D1 as expected: https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38723395836 (commit e633b49) |
+| 2 Fix D1 | done | test_state_machine 33 passed in session; CI run https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38723435334 red only on later defects (commit 8470319) |
+| 3 State machine | done | 41 + chaos state tests pass; commit 9ef97df; green from step 6 CI |
+| 4 Domain | done | test_normalizer 8 passed; commit 3abed57; green from step 6 CI |
+| 5 Orchestrator | done | test_orchestrator_flow 14 passed; commit 261a4a7; green from step 6 CI |
+| 6 Tests | done | first green CI, 98 tests on 3.11/3.12/3.13: https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38724320439 (commit 0154b0e) |
+| 7 Packaging | done | CI green incl. wheel install + version 0.1.0: https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38724620489 (commit 0c88bbd) |
+| 8 Real checks | done (CI pending) | 151 passed on 3.11/3.12/3.13 in session; run https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38725147586 (commit f7368f4) |
 | 9 Audit and reconcile | pending | |
 | 10 Baton | pending | |
 | 11 Provenance | pending | |
@@ -376,4 +376,4 @@ an owner question before it goes live.
 | 13 Release | pending (owner question) | |
 | 14 Sales assets | pending (owner question per listing) | |
 
-**Next action:** Step 0.
+**Next action:** Step 9 (durable audit chain + reconciliation worker).
