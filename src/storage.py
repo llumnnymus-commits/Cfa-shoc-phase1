@@ -207,6 +207,18 @@ class StorageManager:
             session.rollback()
             raise
 
+    def find_by_idempotency_key(
+        self, session: Session, tenant_id: str, idempotency_key: str, states: Optional[list] = None
+    ) -> list[ToolTransactionORM]:
+        """Transactions of a tenant with this idempotency key (optionally in given states)."""
+        query = session.query(ToolTransactionORM).filter(
+            ToolTransactionORM.tenant_id == tenant_id,
+            ToolTransactionORM.idempotency_key == idempotency_key,
+        )
+        if states is not None:
+            query = query.filter(ToolTransactionORM.state.in_(list(states)))
+        return query.order_by(ToolTransactionORM.created_at).all()
+
     def get_transaction(self, session: Session, transaction_id: str) -> Optional[ToolTransactionORM]:
         """Retrieve a transaction by ID."""
         return session.query(ToolTransactionORM).filter(

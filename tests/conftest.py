@@ -9,7 +9,7 @@ from src.storage import StorageManager
 @pytest.fixture(scope="session")
 def test_db_file(tmp_path_factory):
     """Create a temporary database file for session-scoped tests."""
-    fn = tmp_path_factory.mktemp("data").join("test.db")
+    fn = tmp_path_factory.mktemp("data") / "test.db"
     return fn
 
 
