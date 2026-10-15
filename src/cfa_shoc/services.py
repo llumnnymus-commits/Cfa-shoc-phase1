@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID, uuid4
 
 from .domain import (
+    utcnow,
     ActionProposal, CommitDecision, CommitRequest, DispatchRequest, DispatchLease,
     IdempotencyClass, ObservationEnvelope, PolicyDecision, PreflightResult,
     RawResult, ResultVerification, RiskClass, RollbackStrategy, SideEffectClass, ToolTransaction,
@@ -61,7 +62,7 @@ class CapabilitySnapshotService:
             "principal_id": principal_id,
             "tenant_id": tenant_id,
             **content,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": utcnow().isoformat(),
         }
         snapshot["hash"] = self._compute_hash(
             {"content": content, "content_version": self.content_version}
@@ -74,7 +75,7 @@ class CapabilitySnapshotService:
         published = {
             **snapshot,
             "sequence": self.snapshot_sequence,
-            "published_at": datetime.utcnow().isoformat(),
+            "published_at": utcnow().isoformat(),
         }
         self.snapshots.append(published)
         return published
@@ -355,7 +356,7 @@ class PolicyDecisionPoint:
             contract_hash=contract.get("hash", ""),
             ledger_hash=ledger.get("hash", ""),
             signature=self._sign_decision(decision_id, approved, contract),
-            expires_at=datetime.utcnow() + timedelta(minutes=5),
+            expires_at=utcnow() + timedelta(minutes=5),
             approver_type="system",
             approver_id="policy_engine",
         )
@@ -382,7 +383,7 @@ class PolicyDecisionPoint:
         data_to_sign = {
             "decision_id": str(decision_id),
             "approved": approved,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": utcnow().isoformat(),
         }
         data_str = json.dumps(data_to_sign, sort_keys=True)
         return hashlib.sha256(data_str.encode()).hexdigest()
@@ -433,7 +434,7 @@ class TransactionCoordinator:
         try:
             next_state, reason = TransactionStateMachine.transition(tx.state, event)
             tx.state = next_state
-            tx.updated_at = datetime.utcnow()
+            tx.updated_at = utcnow()
             return True, reason
         except Exception as e:
             return False, str(e)
@@ -457,7 +458,7 @@ class TransactionCoordinator:
         lease = DispatchLease(
             transaction_id=tx.transaction_id,
             owner_id=owner_id,
-            expires_at=datetime.utcnow() + timedelta(seconds=30),
+            expires_at=utcnow() + timedelta(seconds=30),
         )
         self.leases[lease.lease_token] = lease
         return lease
@@ -474,7 +475,7 @@ class TransactionCoordinator:
         lease = self.leases.get(lease_token)
         if not lease:
             return False
-        return lease.expires_at > datetime.utcnow()
+        return lease.expires_at > utcnow()
 
 
 class ToolAdapter:
@@ -517,7 +518,7 @@ class ToolAdapter:
             "headers": {},
             "tool_id": request.tool_id,
             "connector_id": request.connector_id,
-            "received_at": datetime.utcnow().isoformat(),
+            "received_at": utcnow().isoformat(),
         }
         handler = self.adapters.get(request.tool_id)
         if handler is None:
@@ -607,7 +608,7 @@ def to_raw_result(raw: Any) -> Optional[RawResult]:
         headers=dict(raw.get("headers") or {}),
         body=raw.get("body"),
         external_operation_id=raw.get("external_operation_id"),
-        received_at=received_at or datetime.utcnow(),
+        received_at=received_at or utcnow(),
         output=raw.get("output"),
         tool_id=raw.get("tool_id"),
         connector_id=raw.get("connector_id"),
@@ -688,14 +689,14 @@ class CommitMembrane:
             checks={"all_invariants_hold": True},
             decision="APPROVE",
             signature=self._sign_decision(request.transaction_id),
-            expires_at=datetime.utcnow() + timedelta(hours=1),
+            expires_at=utcnow() + timedelta(hours=1),
         )
 
         return True, decision
 
     def _sign_decision(self, transaction_id: UUID) -> str:
         """Sign commit decision."""
-        data = {"transaction_id": str(transaction_id), "timestamp": datetime.utcnow().isoformat()}
+        data = {"transaction_id": str(transaction_id), "timestamp": utcnow().isoformat()}
         data_str = json.dumps(data, sort_keys=True)
         return hashlib.sha256(data_str.encode()).hexdigest()
 

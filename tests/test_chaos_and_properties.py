@@ -9,11 +9,11 @@ Covers:
 """
 
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
-from src.domain import TransactionState, RiskClass, SideEffectClass
-from src.state_machine import TransactionStateMachine, IllegalTransitionError
-from src.storage import StorageManager
+from cfa_shoc.domain import TransactionState, RiskClass, SideEffectClass
+from cfa_shoc.state_machine import TransactionStateMachine, IllegalTransitionError
+from cfa_shoc.storage import StorageManager
 
 
 class TestChaosScenarios:
@@ -49,8 +49,8 @@ class TestChaosScenarios:
             "transaction_id": transaction_id,
             "owner_id": "owner_1",
             "lease_token": "token_1",
-            "acquired_at": datetime.utcnow(),
-            "expires_at": datetime.utcnow() + timedelta(minutes=5),
+            "acquired_at": datetime.now(timezone.utc),
+            "expires_at": datetime.now(timezone.utc) + timedelta(minutes=5),
         }
 
         lease_data_2 = {
@@ -58,8 +58,8 @@ class TestChaosScenarios:
             "transaction_id": transaction_id,
             "owner_id": "owner_2",
             "lease_token": "token_2",
-            "acquired_at": datetime.utcnow(),
-            "expires_at": datetime.utcnow() + timedelta(minutes=5),
+            "acquired_at": datetime.now(timezone.utc),
+            "expires_at": datetime.now(timezone.utc) + timedelta(minutes=5),
         }
 
         # First lease succeeds
@@ -67,7 +67,7 @@ class TestChaosScenarios:
         assert lease1 is not None
 
         # Second lease on the same transaction while the first is unexpired is refused
-        from src.storage import LeaseConflictError
+        from cfa_shoc.storage import LeaseConflictError
         with pytest.raises(LeaseConflictError):
             storage.acquire_lease(session2, lease_data_2)
 
@@ -81,7 +81,7 @@ class TestChaosScenarios:
 
     def test_expired_policy_decision_rejected(self):
         """Expired policy decisions are rejected even if signature valid."""
-        from src.domain import PolicyDecision
+        from cfa_shoc.domain import PolicyDecision
 
         expired_decision = PolicyDecision(
             decision_id=uuid4(),
@@ -94,13 +94,13 @@ class TestChaosScenarios:
             evidence_refs=[],
             checks={"check1": True},
             signature="valid_sig",
-            expires_at=datetime.utcnow() - timedelta(hours=1),  # Expired
+            expires_at=datetime.now(timezone.utc) - timedelta(hours=1),  # Expired
             approver_type="system",
             approver_id="system",
         )
 
         # Decision is expired
-        assert expired_decision.expires_at < datetime.utcnow()
+        assert expired_decision.expires_at < datetime.now(timezone.utc)
 
     def test_idempotency_key_collision_handling(self):
         """Transactions with same idempotency key don't duplicate side effects."""
@@ -245,8 +245,8 @@ class TestPropertyInvariants:
 
     def test_property_no_unregistered_tool_dispatch(self):
         """Property: Tool must be in capability snapshot to dispatch."""
-        from src.services import CapabilitySnapshotService, PreflightService
-        from src.domain import ActionProposal
+        from cfa_shoc.services import CapabilitySnapshotService, PreflightService
+        from cfa_shoc.domain import ActionProposal
 
         capability = CapabilitySnapshotService()
         preflight = PreflightService(capability)
@@ -285,8 +285,8 @@ class TestPropertyInvariants:
             "transaction_id": tx_id,
             "owner_id": "dispatcher_1",
             "lease_token": str(uuid4()),
-            "acquired_at": datetime.utcnow(),
-            "expires_at": datetime.utcnow() + timedelta(minutes=5),
+            "acquired_at": datetime.now(timezone.utc),
+            "expires_at": datetime.now(timezone.utc) + timedelta(minutes=5),
         }
         acquired_1 = storage.acquire_lease(session, lease_1)
         assert acquired_1 is not None
@@ -316,7 +316,7 @@ class TestPropertyInvariants:
 
     def test_property_result_verification_before_commit(self):
         """Property: Result must be VERIFIED before committing."""
-        from src.domain import ToolTransaction
+        from cfa_shoc.domain import ToolTransaction
 
         # Simulate transaction in COMMITTED state
         tx = ToolTransaction(
@@ -331,7 +331,7 @@ class TestPropertyInvariants:
 
     def test_property_monotonic_ledger_snapshots(self):
         """Property: Ledger snapshot sequence numbers are monotonically increasing."""
-        from src.services import CapabilitySnapshotService
+        from cfa_shoc.services import CapabilitySnapshotService
 
         service = CapabilitySnapshotService()
 
@@ -348,7 +348,7 @@ class TestPropertyInvariants:
 
     def test_property_policy_decision_expiry(self):
         """Property: Policy decisions expire and become stale."""
-        from src.domain import PolicyDecision
+        from cfa_shoc.domain import PolicyDecision
 
         # Fresh decision
         fresh = PolicyDecision(
@@ -359,7 +359,7 @@ class TestPropertyInvariants:
             subject_ref="ref1",
             contract_hash="h1",
             ledger_hash="h2",
-            expires_at=datetime.utcnow() + timedelta(hours=1),
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
         )
 
         # Expired decision
@@ -371,12 +371,12 @@ class TestPropertyInvariants:
             subject_ref="ref2",
             contract_hash="h1",
             ledger_hash="h2",
-            expires_at=datetime.utcnow() - timedelta(hours=1),
+            expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
         )
 
         # Verify freshness
-        assert fresh.expires_at > datetime.utcnow()
-        assert expired.expires_at < datetime.utcnow()
+        assert fresh.expires_at > datetime.now(timezone.utc)
+        assert expired.expires_at < datetime.now(timezone.utc)
 
     def test_property_risk_classification_consistency(self):
         """Property: Risk classification values are consistent and ordered."""
@@ -412,7 +412,7 @@ class TestBoundaryConditions:
 
     def test_empty_arguments_dict(self):
         """Transaction with empty arguments is valid."""
-        from src.domain import ToolTransaction
+        from cfa_shoc.domain import ToolTransaction
 
         tx = ToolTransaction(
             transaction_id=uuid4(),
@@ -428,7 +428,7 @@ class TestBoundaryConditions:
 
     def test_very_large_payload(self):
         """Large payloads are handled."""
-        from src.domain import ToolTransaction
+        from cfa_shoc.domain import ToolTransaction
 
         large_dict = {f"key_{i}": f"value_{i}" * 100 for i in range(100)}
 
@@ -441,7 +441,7 @@ class TestBoundaryConditions:
 
     def test_none_optional_fields(self):
         """Optional fields can be None."""
-        from src.domain import ToolTransaction
+        from cfa_shoc.domain import ToolTransaction
 
         tx = ToolTransaction(
             transaction_id=uuid4(),
@@ -457,9 +457,9 @@ class TestBoundaryConditions:
 
     def test_deadline_far_future(self):
         """Deadlines far in the future are valid."""
-        from src.domain import ToolTransaction
+        from cfa_shoc.domain import ToolTransaction
 
-        far_future = datetime.utcnow() + timedelta(days=365)
+        far_future = datetime.now(timezone.utc) + timedelta(days=365)
 
         tx = ToolTransaction(
             transaction_id=uuid4(),

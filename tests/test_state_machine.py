@@ -9,8 +9,8 @@ Covers:
 """
 
 import pytest
-from src.domain import TransactionState
-from src.state_machine import TransactionStateMachine, IllegalTransitionError, TransactionInvariants
+from cfa_shoc.domain import TransactionState
+from cfa_shoc.state_machine import TransactionStateMachine, IllegalTransitionError, TransactionInvariants
 
 
 class TestTransactionStateMachine:

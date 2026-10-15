@@ -9,13 +9,13 @@ from uuid import uuid4
 
 import pytest
 
-from src.domain import TransactionState
-from src.orchestrator import OrchestrationContext, RUN_TOOL_NODE
-from src.services import (
+from cfa_shoc.domain import TransactionState
+from cfa_shoc.orchestrator import OrchestrationContext, RUN_TOOL_NODE
+from cfa_shoc.services import (
     ActionNormalizer, AuditLedger, CapabilitySnapshotService, CommitMembrane,
     PolicyDecisionPoint, PreflightService, ResultVerifier, ToolAdapter,
 )
-from src.storage import CommitDecisionORM, LeaseConflictError, StorageManager
+from cfa_shoc.storage import CommitDecisionORM, LeaseConflictError, StorageManager
 
 
 class Env:

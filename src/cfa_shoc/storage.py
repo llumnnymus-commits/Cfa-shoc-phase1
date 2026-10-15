@@ -4,16 +4,38 @@ CFA-SHOC Storage Layer
 PostgreSQL schema and ORM models for transaction truth and audit ledger.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
-from uuid import UUID
 from sqlalchemy import (
-    JSON, Column, DateTime, ForeignKey, Integer, String, Text, create_engine, Index
+    JSON, Column, DateTime, ForeignKey, Integer, String, Text, TypeDecorator, create_engine, Index
 )
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
+
+from .domain import utcnow
 
 Base = declarative_base()
+
+
+class UTCDateTime(TypeDecorator):
+    """
+    Stores datetimes as naive UTC and returns them as timezone-aware UTC.
+
+    Naive values passed in are taken to be UTC already. This keeps SQLite (which drops
+    timezone information) and PostgreSQL consistent: store UTC, compare UTC.
+    """
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is not None and value.tzinfo is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+
+    def process_result_value(self, value, dialect):
+        if value is not None and value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value
 
 
 class LeaseConflictError(Exception):
@@ -46,9 +68,9 @@ class ToolTransactionORM(Base):
     result_envelope = Column(JSON)
     policy_decision = Column(JSON)
     verification = Column(JSON)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    deadline_at = Column(DateTime)
+    created_at = Column(UTCDateTime, nullable=False, default=utcnow)
+    updated_at = Column(UTCDateTime, nullable=False, default=utcnow)
+    deadline_at = Column(UTCDateTime)
     version = Column(Integer, nullable=False, default=0)
 
     __table_args__ = (
@@ -73,7 +95,7 @@ class TransactionEventORM(Base):
     payload = Column(JSON, nullable=False)
     prior_hash = Column(String(256))
     event_hash = Column(String(256), nullable=False)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(UTCDateTime, nullable=False, default=utcnow)
 
     __table_args__ = (
         Index("ix_event_transaction", "transaction_id"),
@@ -96,10 +118,10 @@ class CommitDecisionORM(Base):
     checks = Column(JSON, nullable=False)
     decision = Column(String(50), nullable=False)  # APPROVE, DENY
     signature = Column(Text, nullable=False)
-    expires_at = Column(DateTime, nullable=False)
+    expires_at = Column(UTCDateTime, nullable=False)
     approver_type = Column(String(50), nullable=False)
     approver_id = Column(String(255), nullable=False)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(UTCDateTime, nullable=False, default=utcnow)
 
     __table_args__ = (
         Index("ix_decision_transaction", "transaction_id"),
@@ -115,8 +137,8 @@ class DispatchLeaseORM(Base):
     transaction_id = Column(String(36), ForeignKey("tool_transactions.transaction_id"), nullable=False)
     owner_id = Column(String(255), nullable=False)
     lease_token = Column(String(36), nullable=False, unique=True)
-    acquired_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    expires_at = Column(DateTime, nullable=False)
+    acquired_at = Column(UTCDateTime, nullable=False, default=utcnow)
+    expires_at = Column(UTCDateTime, nullable=False)
 
     __table_args__ = (
         Index("ix_lease_transaction", "transaction_id"),
@@ -138,10 +160,10 @@ class PolicyDecisionORM(Base):
     evidence_refs = Column(JSON, nullable=False)
     checks = Column(JSON, nullable=False)
     signature = Column(Text, nullable=False)
-    expires_at = Column(DateTime, nullable=False)
+    expires_at = Column(UTCDateTime, nullable=False)
     approver_type = Column(String(50), nullable=False)
     approver_id = Column(String(255), nullable=False)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(UTCDateTime, nullable=False, default=utcnow)
 
     __table_args__ = (
         Index("ix_policy_subject", "subject_type", "subject_ref"),
@@ -182,7 +204,7 @@ class StorageManager:
             for key, value in tx_data.items():
                 if key not in ("transaction_id", "created_at"):
                     setattr(existing, key, value)
-            existing.updated_at = datetime.utcnow()
+            existing.updated_at = utcnow()
             existing.version += 1
         else:
             existing = ToolTransactionORM(**tx_data)
@@ -254,7 +276,7 @@ class StorageManager:
         Raises:
             LeaseConflictError: an unexpired lease for the same transaction exists
         """
-        now = datetime.utcnow()
+        now = utcnow()
         held = session.query(DispatchLeaseORM).filter(
             DispatchLeaseORM.transaction_id == lease_data["transaction_id"],
             DispatchLeaseORM.expires_at > now,
