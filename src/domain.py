@@ -106,13 +106,13 @@ class PreflightResult:
 @dataclass
 class PolicyDecision:
     """Policy decision from PolicyDecisionPoint."""
-    decision_id: UUID = field(default_factory=uuid4)
     approved: bool
     reason: str
     subject_type: str  # contract, principal, tenant, policy, etc.
     subject_ref: str
     contract_hash: str
     ledger_hash: str
+    decision_id: UUID = field(default_factory=uuid4)
     evidence_refs: List[str] = field(default_factory=list)
     checks: Dict[str, bool] = field(default_factory=dict)
     signature: str = ""
