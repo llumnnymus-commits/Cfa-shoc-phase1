@@ -149,3 +149,10 @@ supersedes an earlier one says so.
   the state/transition counts in the text match the code. The demo runs as its own CI job and
   asserts every outcome. | "Every claim in the README links to a passing test" must not rot.
   | Historical docs moved to `docs/history/` with the required banner; CLAUDE.md paths updated.
+- **2026-10-15 | Step 13: no release on an unclear answer.** The release question was answered
+  "No preference". CLAUDE.md requires an explicit yes before anything public or published, so
+  the repo stays private and nothing goes to PyPI. Prepared reversible, private pieces only:
+  `release.yml` (PyPI Trusted Publishing, environment `pypi`, tag must equal `v` + version,
+  post-publish job installs from PyPI and runs the demo) and `docs/RELEASE_STEPS.md`. No PR was
+  opened (the owner did not ask for one); merging is step 1 of the owner's steps. | Publishing
+  cannot be undone. | Release waits for an explicit yes.

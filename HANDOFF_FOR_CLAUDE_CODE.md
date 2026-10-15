@@ -373,7 +373,7 @@ an owner question before it goes live.
 | 10 Baton | done | spec tests 1-9 pass; CI green: https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38725981928 (commit bcdeb91) |
 | 11 Provenance | done | spec tests 1-7 pass; CI green: https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38726301961 (commit 4be475c) |
 | 12 Demo and docs | done | CI green incl. demo job printing DEMO OK: https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38726669036 (commit 73415c7) |
-| 13 Release | waiting for the owner's answer (asked 2026-10-15) | |
+| 13 Release | prepared, NOT released: owner answered "No preference" (not a yes) on 2026-10-15 | release.yml + docs/RELEASE_STEPS.md added; release workflow UNVERIFIED (runs only on a published release) |
 | 14 Sales assets | pending (owner question per listing) | |
 
-**Next action:** Step 13 owner question (public repo + MIT + PyPI release), asked once with the recommended default.
+**Next action:** Owner gives an explicit yes or no to the release. On yes, the owner follows `docs/RELEASE_STEPS.md` (merge, make public, PyPI pending publisher, publish release v0.1.0); Claude then verifies the Release run and the PyPI page. Step 14 waits for that.
