@@ -16,6 +16,10 @@ from sqlalchemy.orm import Session, sessionmaker
 Base = declarative_base()
 
 
+class LeaseConflictError(Exception):
+    """Raised when an unexpired dispatch lease already exists for the transaction."""
+
+
 class ToolTransactionORM(Base):
     """ORM model for tool_transactions table."""
     __tablename__ = "tool_transactions"
@@ -164,6 +168,12 @@ class StorageManager:
 
     def save_transaction(self, session: Session, tx_data: Dict[str, Any]) -> ToolTransactionORM:
         """Save or update a tool transaction."""
+        existing = self._upsert_transaction(session, tx_data)
+        session.commit()
+        return existing
+
+    def _upsert_transaction(self, session: Session, tx_data: Dict[str, Any]) -> ToolTransactionORM:
+        """Insert or update a transaction row without committing."""
         existing = session.query(ToolTransactionORM).filter(
             ToolTransactionORM.transaction_id == tx_data["transaction_id"]
         ).first()
@@ -177,9 +187,25 @@ class StorageManager:
         else:
             existing = ToolTransactionORM(**tx_data)
             session.add(existing)
-
-        session.commit()
+        session.flush()
         return existing
+
+    def record_transition(
+        self, session: Session, tx_data: Dict[str, Any], event_data: Dict[str, Any]
+    ) -> TransactionEventORM:
+        """
+        Persist the transaction's new state and append its audit event in ONE database
+        transaction. Either both are stored or neither is.
+        """
+        try:
+            self._upsert_transaction(session, tx_data)
+            event = TransactionEventORM(**event_data)
+            session.add(event)
+            session.commit()
+            return event
+        except Exception:
+            session.rollback()
+            raise
 
     def get_transaction(self, session: Session, transaction_id: str) -> Optional[ToolTransactionORM]:
         """Retrieve a transaction by ID."""
@@ -210,7 +236,21 @@ class StorageManager:
         return decision
 
     def acquire_lease(self, session: Session, lease_data: Dict[str, Any]) -> DispatchLeaseORM:
-        """Acquire a dispatch lease."""
+        """
+        Acquire a dispatch lease.
+
+        Raises:
+            LeaseConflictError: an unexpired lease for the same transaction exists
+        """
+        now = datetime.utcnow()
+        held = session.query(DispatchLeaseORM).filter(
+            DispatchLeaseORM.transaction_id == lease_data["transaction_id"],
+            DispatchLeaseORM.expires_at > now,
+        ).first()
+        if held is not None:
+            raise LeaseConflictError(
+                f"Transaction {lease_data['transaction_id']} already leased by {held.owner_id}"
+            )
         lease = DispatchLeaseORM(**lease_data)
         session.add(lease)
         session.commit()

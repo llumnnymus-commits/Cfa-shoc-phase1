@@ -12,16 +12,15 @@ from typing import Any, Dict, Optional, Tuple
 from uuid import UUID, uuid4
 
 from .domain import (
-    ActionProposal, CommitRequest, DispatchRequest, DispatchLease, ObservationEnvelope,
-    PolicyDecision, PreflightResult, ResultVerification, ToolTransaction, TransactionEvent,
-    TransactionState,
+    ActionProposal, CommitDecision, CommitRequest, DispatchLease, DispatchRequest,
+    ObservationEnvelope, PolicyDecision, PreflightResult, RawResult, ResultVerification,
+    ToolTransaction, TransactionEvent, TransactionState,
 )
 from .state_machine import TransactionStateMachine, IllegalTransitionError
-from .storage import StorageManager
+from .storage import LeaseConflictError, StorageManager
 from .services import (
     CapabilitySnapshotService, ActionNormalizer, PreflightService, PolicyDecisionPoint,
-    TransactionCoordinator, ToolAdapter, ResultVerifier, CommitMembrane, AuditLedger,
-    ReconciliationWorker,
+    ToolAdapter, ResultVerifier, CommitMembrane, AuditLedger, to_raw_result,
 )
 
 
@@ -36,6 +35,7 @@ class OrchestrationContext:
         principal_id: str,
         tenant_id: str,
         requested_by: str,
+        contract: Optional[Dict[str, Any]] = None,
     ):
         self.proposal_id = proposal_id
         self.episode_id = episode_id
@@ -43,6 +43,8 @@ class OrchestrationContext:
         self.principal_id = principal_id
         self.tenant_id = tenant_id
         self.requested_by = requested_by  # "model", "user", "policy", "recovery"
+        # Episode contract: {"scopes": [...], "pre_authorized": [...], "max_risk": "..."}
+        self.contract: Dict[str, Any] = contract if contract is not None else {}
         self.created_at = datetime.utcnow()
         self.ledger_snapshot = None
         self.transaction_id = None
@@ -73,10 +75,10 @@ class RUN_TOOL_NODE:
     6. Lease acquisition (acquire short-lived idempotency lock)
     7. Dispatch (invoke tool via ToolAdapter/connector boundary)
     8. Result verification (check signature, schema, consistency)
-    9. Commit (CommitMembrane persists verified result to durable state)
+    9. Commit (CommitMembrane re-reads ledger and contract, then gates the commit)
 
-    Per Phase 1 specification section 3.2, legal state transitions are enforced.
-    Per section 3.3, transaction invariants are validated at each step.
+    Every state change goes through TransactionStateMachine.transition and is persisted
+    together with its audit event in one database transaction.
     """
 
     def __init__(
@@ -101,6 +103,8 @@ class RUN_TOOL_NODE:
         self.verifier = verifier
         self.commit_membrane = commit_membrane
         self.audit_ledger = audit_ledger
+        # Contract each transaction started with (fallback when the registry has none)
+        self._run_contracts: Dict[str, Dict[str, Any]] = {}
 
     def execute(
         self,
@@ -115,210 +119,198 @@ class RUN_TOOL_NODE:
             context: Immutable context for this execution
 
         Returns:
-            (ToolTransaction, PreflightResult or error)
+            (ToolTransaction, PreflightResult) - the result's `allowed` is True only when
+            the transaction COMMITTED or was accepted asynchronously (PENDING_EXTERNAL).
 
         Raises:
-            ValueError: On validation failures
-            IllegalTransitionError: On invalid state transition
+            IllegalTransitionError: On invalid state transition (a bug, never expected)
         """
         session = self.storage.get_session()
+        transaction: Optional[ToolTransaction] = None
         try:
             # Step 1: Ledger refresh - get current capability snapshot
-            ledger_snapshot = self._ledger_refresh(context, session)
+            ledger_snapshot = self._ledger_refresh(context)
             context.ledger_snapshot = ledger_snapshot
+            contract = self._current_contract(context)
+            contract_hash = self.capability_service.contract_hash(contract)
 
             # Step 2: Proposal normalization - convert to canonical ActionProposal
-            action_proposal = self._normalize_proposal(model_proposal, context)
-            context.transaction_id = action_proposal.proposal_id
+            action_proposal, error = self._normalize_proposal(
+                model_proposal, context, ledger_snapshot, contract_hash
+            )
+            if action_proposal is None:
+                # Refused before any transaction could be dispatched; still audited.
+                transaction = self._refused_transaction(
+                    model_proposal, context, ledger_snapshot, contract_hash
+                )
+                context.transaction_id = transaction.transaction_id
+                self._record(
+                    session, transaction, "orchestration_started",
+                    payload={"context": context.to_dict(), "model_proposal": _safe(model_proposal)},
+                )
+                self._transition(
+                    session, transaction, "preflight_failed",
+                    {"reason": f"Normalization failed: {error}"},
+                )
+                return transaction, PreflightResult(
+                    allowed=False, reason=f"Normalization failed: {error}",
+                    checks_performed=["normalization"], failures=[error],
+                )
 
             # Create durable transaction record in PROPOSED state
             transaction = self._create_transaction(action_proposal, context, ledger_snapshot)
-            tx_orm = self.storage.save_transaction(
-                session,
-                self._tx_to_dict(transaction, TransactionState.PROPOSED),
-            )
-            transaction.transaction_id = UUID(tx_orm.transaction_id)
-
-            # Log transition event
-            self._log_event(
-                session,
-                transaction.transaction_id,
-                "orchestration_started",
-                from_state=None,
-                to_state=TransactionState.PROPOSED.value,
+            context.transaction_id = transaction.transaction_id
+            self._run_contracts[str(transaction.transaction_id)] = context.contract
+            self._record(
+                session, transaction, "orchestration_started",
                 payload={"context": context.to_dict(), "action_proposal": self._ap_to_dict(action_proposal)},
             )
 
             # Step 3: Preflight check - 8 deterministic checks
-            preflight_result = self._preflight_check(transaction, ledger_snapshot, session)
+            preflight_result = self.preflight.check(action_proposal, ledger_snapshot, contract)
             if not preflight_result.allowed:
-                self._transition(
-                    session, transaction, TransactionState.PROPOSED, "preflight_failed"
-                )
+                self._transition(session, transaction, "preflight_failed",
+                                 {"reason": preflight_result.reason,
+                                  "failures": preflight_result.failures})
                 return transaction, preflight_result
-
-            # Transition to PREFLIGHTED
-            transaction.state = TransactionState.PREFLIGHTED
-            self._transition(session, transaction, TransactionState.PROPOSED, "preflight_passed")
+            self._transition(session, transaction, "preflight_passed",
+                             {"checks": preflight_result.checks_performed})
 
             # Step 4: Policy evaluation - PolicyDecisionPoint yields signed decision
-            policy_decision = self._policy_evaluation(transaction, ledger_snapshot, session)
+            policy_decision = self.policy_point.evaluate(action_proposal, ledger_snapshot, contract)
+            transaction.policy_decision = self._pd_to_dict(policy_decision)
             if not policy_decision.approved:
-                self._transition(
-                    session, transaction, TransactionState.PREFLIGHTED, "policy_denied"
-                )
-                transaction.policy_decision = self._pd_to_dict(policy_decision)
-                self.storage.save_transaction(session, self._tx_to_dict(transaction, TransactionState.REJECTED))
+                self._transition(session, transaction, "policy_denied",
+                                 {"reason": policy_decision.reason})
                 return transaction, PreflightResult(
                     allowed=False, reason=f"Policy denied: {policy_decision.reason}"
                 )
+            self._transition(session, transaction, "policy_approved",
+                             {"decision_id": str(policy_decision.decision_id)})
 
-            # Transition to AUTHORIZED
-            transaction.policy_decision = self._pd_to_dict(policy_decision)
-            self._transition(session, transaction, TransactionState.PREFLIGHTED, "policy_approved")
-            transaction.state = TransactionState.AUTHORIZED
+            return self._authorize_and_run(session, transaction, policy_decision, contract)
 
-            # Step 5: Authorization - verify policy signature and expiry
-            if not self._verify_authorization(policy_decision):
-                self._transition(
-                    session, transaction, TransactionState.AUTHORIZED, "policy_denied"
+        except Exception as e:
+            session.rollback()
+            if transaction is not None:
+                event = self._make_event(
+                    transaction, "orchestration_error", None, None,
+                    {"error": str(e), "exception_type": type(e).__name__},
                 )
-                return transaction, PreflightResult(
-                    allowed=False, reason="Policy decision expired or invalid signature"
-                )
+                self.audit_ledger.append(event)
+            raise
+        finally:
+            session.close()
 
-            # Step 6: Lease acquisition - acquire short-lived idempotency lock
-            lease = self._acquire_lease(transaction, session)
-            if not lease:
-                return transaction, PreflightResult(
-                    allowed=False, reason="Could not acquire idempotency lock (concurrent execution)"
-                )
+    # Steps 5 to 9 (shared with flows that authorize later, e.g. explicit confirmation)
 
-            # Transition to DISPATCHED
-            self._transition(session, transaction, TransactionState.AUTHORIZED, "dispatch_started")
-            transaction.state = TransactionState.DISPATCHED
+    def _authorize_and_run(
+        self,
+        session,
+        transaction: ToolTransaction,
+        policy_decision: PolicyDecision,
+        contract: Dict[str, Any],
+    ) -> Tuple[ToolTransaction, PreflightResult]:
+        """Run steps 5 to 9 for a transaction that is AUTHORIZED."""
+        # Step 5: Authorization - verify policy signature and expiry
+        if not self._verify_authorization(policy_decision):
+            reason = "Policy decision expired or invalid signature"
+            self._transition(session, transaction, "authorization_revoked", {"reason": reason})
+            return transaction, PreflightResult(allowed=False, reason=reason)
 
+        # Step 6: Lease acquisition - acquire short-lived idempotency lock
+        lease = self._acquire_lease(transaction, session)
+        if lease is None:
+            reason = "Could not acquire idempotency lock (concurrent execution)"
+            self._transition(session, transaction, "authorization_revoked", {"reason": reason})
+            return transaction, PreflightResult(allowed=False, reason=reason)
+
+        try:
             # Step 7: Dispatch - invoke tool via ToolAdapter/connector boundary
-            raw_result = self._dispatch(transaction, session)
-            if raw_result is None:
-                self._transition(
-                    session, transaction, TransactionState.DISPATCHED, "connector_error"
-                )
-                self._release_lease(lease, session)
+            self._transition(session, transaction, "dispatch_started",
+                             {"lease_token_hash": _sha(lease.lease_token)})
+            try:
+                raw_result = to_raw_result(self._dispatch(transaction))
+            except TimeoutError as exc:
+                reason = f"Dispatch deadline exceeded: {exc}"
+                self._transition(session, transaction, "deadline_exceeded", {"reason": reason})
+                return transaction, PreflightResult(allowed=False, reason=reason)
+
+            if raw_result is None or raw_result.transport_status == "error":
+                detail = raw_result.output if raw_result is not None else None
+                self._transition(session, transaction, "connector_error",
+                                 {"reason": "Tool dispatch failed (connector error)",
+                                  "detail": _safe(detail)})
                 return transaction, PreflightResult(
                     allowed=False, reason="Tool dispatch failed (connector error)"
                 )
 
-            # Update transaction with external operation ID if available
             if raw_result.external_operation_id:
                 transaction.external_operation_id = raw_result.external_operation_id
 
-            # Check if result is async (PENDING_EXTERNAL)
+            # Asynchronous acceptance: reconciliation finishes the transaction later
             if raw_result.transport_status == "async_accepted":
-                self._transition(
-                    session, transaction, TransactionState.DISPATCHED, "async_accepted"
-                )
-                transaction.state = TransactionState.PENDING_EXTERNAL
                 transaction.deadline_at = datetime.utcnow() + timedelta(hours=24)
-                self.storage.save_transaction(session, self._tx_to_dict(transaction, TransactionState.PENDING_EXTERNAL))
-                self._release_lease(lease, session)
+                self._transition(session, transaction, "async_accepted",
+                                 {"external_operation_id": transaction.external_operation_id})
                 return transaction, PreflightResult(
                     allowed=True,
                     reason="Tool dispatch accepted asynchronously; awaiting external status query",
                 )
 
-            # Sync result received
-            self._transition(session, transaction, TransactionState.DISPATCHED, "response_received")
-            transaction.state = TransactionState.RETURNED
+            self._transition(session, transaction, "response_received",
+                             {"status_code": raw_result.status_code})
 
             # Step 8: Result verification - check signature, schema, consistency
-            verification = self._verify_result(transaction, raw_result, ledger_snapshot, session)
+            verification = self.verifier.verify(raw_result, transaction)
             transaction.verification = self._rv_to_dict(verification)
-
             if not verification.passed:
-                self._transition(
-                    session, transaction, TransactionState.RETURNED, "verification_failed"
-                )
-                self._release_lease(lease, session)
+                self._transition(session, transaction, "verification_failed",
+                                 {"reason": verification.reason})
                 return transaction, PreflightResult(
                     allowed=False, reason=f"Result verification failed: {verification.reason}"
                 )
 
-            # Transition to VERIFIED
-            self._transition(session, transaction, TransactionState.RETURNED, "verification_passed")
-            transaction.state = TransactionState.VERIFIED
+            observation = self._observation(transaction, raw_result, verification)
+            transaction.result_envelope = {
+                "observation": self._oe_to_dict(observation),
+                "verified": True,
+            }
+            self._transition(session, transaction, "verification_passed",
+                             {"output_hash": observation.integrity_signature})
 
-            # Wrap result in ObservationEnvelope
-            observation = ObservationEnvelope(
-                source_class="tool_output",
-                authority_level="non_authoritative_content",
-                content=raw_result.body,
-                transaction_id=transaction.transaction_id,
-                connector_id=transaction.connector_id or "",
-                integrity_signature=verification.signature_valid and hashlib.sha256(
-                    json.dumps(raw_result.body or {}, sort_keys=True, default=str).encode()
-                ).hexdigest() or "",
-            )
-
-            # Step 9: Commit - CommitMembrane persists verified result to durable state
-            commit_request = CommitRequest(
-                transaction_id=transaction.transaction_id,
-                verified_result_ref=str(observation.transaction_id),
-                contract_hash=transaction.contract_hash,
-                ledger_hash=transaction.ledger_hash,
-                risk_class=transaction.risk_class,
-                side_effect_class=transaction.side_effect_class,
-                rollback_strategy=transaction.rollback_strategy,
-                evidence_refs=[str(observation.transaction_id)],
-            )
-
-            commit_approved = self._commit(transaction, commit_request, observation, session)
-            self._release_lease(lease, session)
-
-            if commit_approved:
-                self._transition(
-                    session, transaction, TransactionState.VERIFIED, "action_commit_approved"
-                )
-                transaction.state = TransactionState.COMMITTED
-                transaction.result_envelope = {
-                    "observation": self._oe_to_dict(observation),
-                    "verified": True,
-                }
-                self.storage.save_transaction(session, self._tx_to_dict(transaction, TransactionState.COMMITTED))
-                return transaction, PreflightResult(allowed=True, reason="Transaction committed successfully")
-            else:
-                self._transition(
-                    session, transaction, TransactionState.VERIFIED, "action_commit_denied"
-                )
-                return transaction, PreflightResult(
-                    allowed=False, reason="Commit membrane rejected result (precondition violation)"
-                )
-
-        except Exception as e:
-            self._log_event(
-                session,
-                context.transaction_id or uuid4(),
-                "orchestration_error",
-                payload={"error": str(e), "exception_type": type(e).__name__},
-            )
-            raise
+            # Step 9: Commit through the CommitMembrane action gate
+            return self._commit(session, transaction, observation)
         finally:
-            session.close()
+            self._release_lease(lease, session)
 
     # Private orchestration steps
 
-    def _ledger_refresh(self, context: OrchestrationContext, session) -> Dict[str, Any]:
+    def _ledger_refresh(self, context: OrchestrationContext) -> Dict[str, Any]:
         """Step 1: Refresh ledger snapshot with current capability state."""
         snapshot = self.capability_service.refresh_snapshot(context.principal_id, context.tenant_id)
-        snapshot = self.capability_service.publish_snapshot(snapshot)
-        return snapshot
+        return self.capability_service.publish_snapshot(snapshot)
+
+    def _current_contract(self, context: OrchestrationContext) -> Dict[str, Any]:
+        """The episode contract as it is right now (registry first, then the context)."""
+        return self.capability_service.get_contract(context.episode_id, context.contract)
 
     def _normalize_proposal(
-        self, model_proposal: Dict[str, Any], context: OrchestrationContext
-    ) -> ActionProposal:
+        self,
+        model_proposal: Any,
+        context: OrchestrationContext,
+        ledger_snapshot: Dict[str, Any],
+        contract_hash: str,
+    ) -> Tuple[Optional[ActionProposal], Optional[str]]:
         """Step 2: Normalize model proposal to canonical ActionProposal."""
         return self.normalizer.normalize(
-            model_proposal, context.proposal_id, context.episode_id, context.task_node_id
+            model_proposal,
+            {**ledger_snapshot, "contract_hash": contract_hash},
+            proposal_id=context.proposal_id,
+            episode_id=context.episode_id,
+            task_node_id=context.task_node_id,
+            principal_id=context.principal_id,
+            tenant_id=context.tenant_id,
         )
 
     def _create_transaction(
@@ -328,7 +320,7 @@ class RUN_TOOL_NODE:
         ledger_snapshot: Dict[str, Any],
     ) -> ToolTransaction:
         """Create initial durable transaction record."""
-        transaction = ToolTransaction(
+        return ToolTransaction(
             transaction_id=uuid4(),
             proposal_id=action_proposal.proposal_id,
             episode_id=action_proposal.episode_id,
@@ -348,40 +340,52 @@ class RUN_TOOL_NODE:
             rollback_strategy=action_proposal.rollback_strategy.value,
             state=TransactionState.PROPOSED,
         )
-        return transaction
 
-    def _preflight_check(
+    def _refused_transaction(
         self,
-        transaction: ToolTransaction,
+        model_proposal: Any,
+        context: OrchestrationContext,
         ledger_snapshot: Dict[str, Any],
-        session,
-    ) -> PreflightResult:
-        """Step 3: Perform 8 deterministic preflight checks."""
-        return self.preflight.check(transaction, ledger_snapshot)
-
-    def _policy_evaluation(
-        self,
-        transaction: ToolTransaction,
-        ledger_snapshot: Dict[str, Any],
-        session,
-    ) -> PolicyDecision:
-        """Step 4: Evaluate proposal against policy framework."""
-        return self.policy_point.evaluate(transaction, ledger_snapshot)
+        contract_hash: str,
+    ) -> ToolTransaction:
+        """Record for a proposal that failed normalization (it is never dispatched)."""
+        raw = model_proposal if isinstance(model_proposal, dict) else {}
+        arguments = raw.get("arguments") if isinstance(raw.get("arguments"), dict) else {}
+        return ToolTransaction(
+            transaction_id=uuid4(),
+            proposal_id=context.proposal_id,
+            episode_id=context.episode_id,
+            task_node_id=context.task_node_id,
+            tool_id=str(raw.get("tool_id") or ""),
+            operation=str(raw.get("operation") or ""),
+            connector_id=raw.get("connector_id") if isinstance(raw.get("connector_id"), str) else None,
+            principal_id=context.principal_id,
+            tenant_id=context.tenant_id,
+            ledger_hash=ledger_snapshot["hash"],
+            contract_hash=contract_hash,
+            input_payload=_safe(arguments),
+            input_schema_hash="",
+            idempotency_key=str(raw.get("idempotency_key") or ""),
+            risk_class=str(raw.get("risk_class") or ""),
+            side_effect_class=str(raw.get("side_effect_class") or ""),
+            rollback_strategy=str(raw.get("rollback_strategy") or ""),
+            state=TransactionState.PROPOSED,
+        )
 
     def _verify_authorization(self, policy_decision: PolicyDecision) -> bool:
         """Step 5: Verify policy signature and check expiry."""
+        if not policy_decision.approved:
+            return False
         if policy_decision.expires_at < datetime.utcnow():
             return False
-        # In production, verify policy_decision.signature against policy signer's key
+        verify = getattr(self.policy_point, "verify_signature", None)
+        if verify is not None:
+            return bool(verify(policy_decision))
         return True
 
-    def _acquire_lease(
-        self, transaction: ToolTransaction, session
-    ) -> Optional[DispatchLease]:
-        """Step 6: Acquire short-lived idempotency lock."""
-        from .domain import DispatchLease as DispatchLeaseDomain
-
-        lease_domain = DispatchLeaseDomain(
+    def _acquire_lease(self, transaction: ToolTransaction, session) -> Optional[DispatchLease]:
+        """Step 6: Acquire short-lived idempotency lock. None if another holder has it."""
+        lease = DispatchLease(
             transaction_id=transaction.transaction_id,
             owner_id=transaction.principal_id,
             lease_token=str(uuid4()),
@@ -389,12 +393,13 @@ class RUN_TOOL_NODE:
             expires_at=datetime.utcnow() + timedelta(minutes=5),
         )
         try:
-            lease = self.storage.acquire_lease(session, self._dl_to_dict(lease_domain))
-            return lease_domain
-        except Exception:
+            self.storage.acquire_lease(session, self._dl_to_dict(lease))
+            return lease
+        except LeaseConflictError:
+            session.rollback()
             return None
 
-    def _dispatch(self, transaction: ToolTransaction, session) -> Optional[Any]:
+    def _dispatch(self, transaction: ToolTransaction) -> Dict[str, Any]:
         """Step 7: Dispatch tool invocation via ToolAdapter."""
         dispatch_request = DispatchRequest(
             transaction_id=transaction.transaction_id,
@@ -406,29 +411,61 @@ class RUN_TOOL_NODE:
             deadline_at=datetime.utcnow() + timedelta(minutes=5),
             auth_context_ref=transaction.principal_id,
         )
-        return self.tool_adapter.invoke(dispatch_request)
+        return self.tool_adapter.dispatch(dispatch_request)
 
-    def _verify_result(
-        self,
-        transaction: ToolTransaction,
-        raw_result: Any,
-        ledger_snapshot: Dict[str, Any],
-        session,
-    ) -> ResultVerification:
-        """Step 8: Verify result signature, schema, and consistency."""
-        return self.verifier.verify(transaction, raw_result, ledger_snapshot)
+    def _observation(
+        self, transaction: ToolTransaction, raw_result: RawResult, verification: ResultVerification
+    ) -> ObservationEnvelope:
+        """Wrap verified tool output; it stays non-authoritative content."""
+        content = raw_result.output
+        return ObservationEnvelope(
+            source_class="tool_output",
+            authority_level="non_authoritative_content",
+            content=content,
+            transaction_id=transaction.transaction_id,
+            connector_id=transaction.connector_id or "",
+            integrity_signature=_sha(json.dumps(content, sort_keys=True, default=str)),
+        )
 
     def _commit(
-        self,
-        transaction: ToolTransaction,
-        commit_request: CommitRequest,
-        observation: ObservationEnvelope,
-        session,
-    ) -> bool:
-        """Step 9: CommitMembrane persists verified result to durable state."""
-        return self.commit_membrane.commit(commit_request, observation)
+        self, session, transaction: ToolTransaction, observation: ObservationEnvelope
+    ) -> Tuple[ToolTransaction, PreflightResult]:
+        """Step 9: re-read ledger and contract, then commit only through the action gate."""
+        commit_request = CommitRequest(
+            transaction_id=transaction.transaction_id,
+            verified_result_ref=observation.integrity_signature,
+            contract_hash=transaction.contract_hash,
+            ledger_hash=transaction.ledger_hash,
+            risk_class=transaction.risk_class,
+            side_effect_class=transaction.side_effect_class,
+            rollback_strategy=transaction.rollback_strategy,
+            evidence_refs=[f"tx:{transaction.transaction_id}",
+                           f"output:{observation.integrity_signature}"],
+        )
+        current_ledger = self.capability_service.refresh_snapshot(
+            transaction.principal_id, transaction.tenant_id
+        )
+        current_contract = self.capability_service.get_contract(
+            transaction.episode_id, self._run_contracts.get(str(transaction.transaction_id), {})
+        )
+        approved, decision = self.commit_membrane.action_gate(
+            commit_request,
+            transaction,
+            current_ledger,
+            {"hash": self.capability_service.contract_hash(current_contract)},
+        )
 
-    def _release_lease(self, lease: DispatchLease, session) -> None:
+        if approved and decision is not None:
+            self.storage.save_commit_decision(session, self._cd_to_dict(decision))
+            self._transition(session, transaction, "action_commit_approved",
+                             {"commit_decision_id": str(decision.decision_id)})
+            return transaction, PreflightResult(allowed=True, reason="Transaction committed successfully")
+
+        reason = "Commit membrane rejected result (ledger, contract or precondition changed)"
+        self._transition(session, transaction, "action_commit_denied", {"reason": reason})
+        return transaction, PreflightResult(allowed=False, reason=reason)
+
+    def _release_lease(self, lease: Optional[DispatchLease], session) -> None:
         """Release idempotency lock after dispatch (success or failure)."""
         if lease:
             self.storage.release_lease(session, lease.lease_token)
@@ -437,53 +474,70 @@ class RUN_TOOL_NODE:
         self,
         session,
         transaction: ToolTransaction,
-        from_state: TransactionState,
         event: str,
+        payload: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Perform state transition and log event."""
+        """
+        The only place the orchestrator changes state: state machine transition, then
+        the new state and its audit event are stored in one database transaction.
+        """
+        from_state = transaction.state
         try:
             next_state, reason = TransactionStateMachine.transition(from_state, event)
-            transaction.state = next_state
-            self._log_event(
-                session,
-                transaction.transaction_id,
-                event,
-                from_state=from_state.value,
-                to_state=next_state.value,
-                payload={"reason": reason},
-            )
         except IllegalTransitionError as e:
-            self._log_event(
-                session,
-                transaction.transaction_id,
-                "illegal_transition_attempt",
-                payload={"error": str(e), "from_state": from_state.value, "event": event},
-            )
+            self.audit_ledger.append(self._make_event(
+                transaction, "illegal_transition_attempt", from_state.value, None,
+                {"error": str(e), "event": event},
+            ))
             raise
+        transaction.state = next_state
+        transaction.updated_at = datetime.utcnow()
+        self._record(
+            session, transaction, event, from_state.value, next_state.value,
+            {"reason": reason, **(payload or {})},
+        )
 
-    def _log_event(
+    def _record(
         self,
         session,
-        transaction_id: UUID,
+        transaction: ToolTransaction,
         event_type: str,
         from_state: Optional[str] = None,
         to_state: Optional[str] = None,
         payload: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """Log append-only audit event."""
-        self.audit_ledger.append_event(
-            session,
-            transaction_id,
-            event_type,
-            from_state,
-            to_state,
-            payload or {},
+    ) -> TransactionEvent:
+        """Append the audit event and persist the transaction row atomically."""
+        if event_type == "orchestration_started":
+            to_state = transaction.state.value
+        event = self._make_event(transaction, event_type, from_state, to_state, payload or {})
+        self.audit_ledger.append(event)
+        self.storage.record_transition(
+            session, self._tx_to_dict(transaction), self._event_to_dict(event)
+        )
+        return event
+
+    def _make_event(
+        self,
+        transaction: ToolTransaction,
+        event_type: str,
+        from_state: Optional[str],
+        to_state: Optional[str],
+        payload: Dict[str, Any],
+    ) -> TransactionEvent:
+        return TransactionEvent(
+            transaction_id=transaction.transaction_id,
+            event_type=event_type,
+            from_state=from_state,
+            to_state=to_state,
+            actor_type="system",
+            actor_id="run_tool_node",
+            payload=_safe(payload),
         )
 
     # Serialization helpers
 
-    def _tx_to_dict(self, tx: ToolTransaction, state: TransactionState) -> Dict[str, Any]:
-        """Convert ToolTransaction to dict for storage."""
+    def _tx_to_dict(self, tx: ToolTransaction) -> Dict[str, Any]:
+        """Convert ToolTransaction to dict for storage (state is the transaction's own)."""
         return {
             "transaction_id": str(tx.transaction_id),
             "proposal_id": str(tx.proposal_id),
@@ -502,12 +556,27 @@ class RUN_TOOL_NODE:
             "risk_class": tx.risk_class,
             "side_effect_class": tx.side_effect_class,
             "rollback_strategy": tx.rollback_strategy,
-            "state": state.value,
+            "state": tx.state.value,
             "external_operation_id": tx.external_operation_id,
-            "result_envelope": tx.result_envelope,
+            "result_envelope": _safe(tx.result_envelope),
             "policy_decision": tx.policy_decision,
             "verification": tx.verification,
             "deadline_at": tx.deadline_at,
+        }
+
+    def _event_to_dict(self, event: TransactionEvent) -> Dict[str, Any]:
+        return {
+            "event_id": str(event.event_id),
+            "transaction_id": str(event.transaction_id),
+            "event_type": event.event_type,
+            "from_state": event.from_state,
+            "to_state": event.to_state,
+            "actor_type": event.actor_type,
+            "actor_id": event.actor_id,
+            "payload": event.payload,
+            "prior_hash": event.prior_hash,
+            "event_hash": event.event_hash,
+            "created_at": event.created_at,
         }
 
     def _ap_to_dict(self, ap: ActionProposal) -> Dict[str, Any]:
@@ -521,6 +590,7 @@ class RUN_TOOL_NODE:
             "connector_id": ap.connector_id,
             "risk_class": ap.risk_class.value,
             "side_effect_class": ap.side_effect_class.value,
+            "rollback_strategy": ap.rollback_strategy.value,
             "idempotency_key": ap.idempotency_key,
         }
 
@@ -542,6 +612,25 @@ class RUN_TOOL_NODE:
             "approver_id": pd.approver_id,
         }
 
+    def _cd_to_dict(self, cd: CommitDecision) -> Dict[str, Any]:
+        """Convert CommitDecision to dict for storage."""
+        return {
+            "decision_id": str(cd.decision_id),
+            "transaction_id": str(cd.transaction_id),
+            "subject_type": cd.subject_type,
+            "subject_ref": cd.subject_ref,
+            "contract_hash": cd.contract_hash,
+            "ledger_hash": cd.ledger_hash,
+            "evidence_refs": list(cd.evidence_refs),
+            "checks": dict(cd.checks),
+            "decision": cd.decision,
+            "signature": cd.signature,
+            "expires_at": cd.expires_at,
+            "approver_type": cd.approver_type,
+            "approver_id": cd.approver_id,
+            "created_at": cd.created_at,
+        }
+
     def _rv_to_dict(self, rv: ResultVerification) -> Dict[str, Any]:
         """Convert ResultVerification to dict for storage."""
         return {
@@ -551,7 +640,7 @@ class RUN_TOOL_NODE:
             "schema_valid": rv.schema_valid,
             "tool_connector_match": rv.tool_connector_match,
             "status_terminal": rv.status_terminal,
-            "evidence": rv.evidence,
+            "evidence": _safe(rv.evidence),
         }
 
     def _oe_to_dict(self, oe: ObservationEnvelope) -> Dict[str, Any]:
@@ -559,13 +648,13 @@ class RUN_TOOL_NODE:
         return {
             "source_class": oe.source_class,
             "authority_level": oe.authority_level,
-            "content": oe.content,
+            "content": _safe(oe.content),
             "transaction_id": str(oe.transaction_id),
             "connector_id": oe.connector_id,
             "integrity_signature": oe.integrity_signature,
         }
 
-    def _dl_to_dict(self, dl) -> Dict[str, Any]:
+    def _dl_to_dict(self, dl: DispatchLease) -> Dict[str, Any]:
         """Convert DispatchLease to dict for storage."""
         return {
             "lease_id": str(uuid4()),
@@ -575,3 +664,12 @@ class RUN_TOOL_NODE:
             "acquired_at": dl.acquired_at,
             "expires_at": dl.expires_at,
         }
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _safe(value: Any) -> Any:
+    """Make a value JSON-compatible for storage (bytes, UUIDs and datetimes become strings)."""
+    return json.loads(json.dumps(value, default=str)) if value is not None else None

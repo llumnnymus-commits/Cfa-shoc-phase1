@@ -147,6 +147,10 @@ class RawResult:
     body: Optional[bytes] = None
     external_operation_id: Optional[str] = None
     received_at: datetime = field(default_factory=datetime.utcnow)
+    output: Any = None  # parsed tool output (JSON-compatible)
+    tool_id: Optional[str] = None  # echoed by the adapter
+    connector_id: Optional[str] = None  # echoed by the adapter
+    idempotency_key: Optional[str] = None  # echoed when the tool supports it
 
 
 @dataclass

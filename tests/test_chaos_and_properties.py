@@ -66,10 +66,15 @@ class TestChaosScenarios:
         lease1 = storage.acquire_lease(session1, lease_data_1)
         assert lease1 is not None
 
-        # Second lease with same transaction_id also creates (SQLite doesn't enforce unique constraint here)
-        # but in production PostgreSQL it would fail
+        # Second lease on the same transaction while the first is unexpired is refused
+        from src.storage import LeaseConflictError
+        with pytest.raises(LeaseConflictError):
+            storage.acquire_lease(session2, lease_data_2)
+
+        # After release, the second requester can take it
+        assert storage.release_lease(session1, "token_1")
         lease2 = storage.acquire_lease(session2, lease_data_2)
-        assert lease2 is not None  # In-memory doesn't enforce, but schema would
+        assert lease2 is not None
 
         session1.close()
         session2.close()
