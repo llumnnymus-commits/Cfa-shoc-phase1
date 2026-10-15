@@ -19,6 +19,7 @@ from .services import (
     TransactionCoordinator, to_raw_result,
 )
 from .orchestrator import OrchestrationContext, RUN_TOOL_NODE
+from . import baton
 
 __version__ = "0.1.0"
 
@@ -39,4 +40,6 @@ __all__ = [
     "ToolAdapter", "TransactionCoordinator", "to_raw_result",
     # orchestration
     "OrchestrationContext", "RUN_TOOL_NODE",
+    # DRxit baton handoffs
+    "baton",
 ]
