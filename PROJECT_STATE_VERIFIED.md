@@ -40,7 +40,10 @@ of 0.1.0 are listed in README "Limits" (SQLite-only testing, single-process quot
 leases, per-process default HMAC keys, unsigned tool results, source-form certificates).
 
 ## Not done
-- Step 13 (release) needs the owner's yes: public repo, PyPI publish, GitHub Release.
+- Step 13 (release): asked 2026-10-15; the answer was "No preference", which is not the explicit
+  yes CLAUDE.md requires, so nothing was made public or published. Prepared:
+  `.github/workflows/release.yml` (Trusted Publishing; runs only on a published GitHub Release;
+  YAML parses; never run, so UNVERIFIED) and `docs/RELEASE_STEPS.md` (owner phone steps).
 - Step 14 (sales assets) starts after step 13.
 - Spec PDFs (CFA-SHOC v0.2, Phase 1 Addendum) were not attached, so the step 3 state-machine
   choice was not checked against spec section 3.2.
