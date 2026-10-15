@@ -107,11 +107,22 @@ class ActionNormalizer:
     def __init__(self, capability_service: CapabilitySnapshotService):
         self.capability_service = capability_service
 
-    def normalize(self, proposal_input: Any, ledger: Dict[str, Any]) -> Tuple[Optional[ActionProposal], Optional[str]]:
+    def normalize(
+        self,
+        proposal_input: Any,
+        ledger: Dict[str, Any],
+        *,
+        proposal_id: Optional[UUID] = None,
+        episode_id: Optional[UUID] = None,
+        task_node_id: Optional[UUID] = None,
+        principal_id: str = "",
+        tenant_id: str = "",
+    ) -> Tuple[Optional[ActionProposal], Optional[str]]:
         """
         Convert model output to ActionProposal.
 
         Every proposal must resolve to registered tool, operation, schema, connector.
+        Context ids passed by the caller are kept; new ones are made only when absent.
 
         Returns:
             (ActionProposal, None) if valid
@@ -136,11 +147,29 @@ class ActionNormalizer:
         if not isinstance(arguments, dict):
             return None, "Arguments must be a dictionary"
 
+        # Enum fields: unknown values are an error, never an exception
+        try:
+            risk_class = RiskClass(proposal_input.get("risk_class", RiskClass.MEDIUM.value))
+        except ValueError:
+            return None, f"Unknown risk_class: {proposal_input.get('risk_class')!r}"
+        try:
+            side_effect_class = SideEffectClass(
+                proposal_input.get("side_effect_class", SideEffectClass.NONE.value)
+            )
+        except ValueError:
+            return None, f"Unknown side_effect_class: {proposal_input.get('side_effect_class')!r}"
+        try:
+            rollback_strategy = RollbackStrategy(
+                proposal_input.get("rollback_strategy", RollbackStrategy.NONE.value)
+            )
+        except ValueError:
+            return None, f"Unknown rollback_strategy: {proposal_input.get('rollback_strategy')!r}"
+
         # Create canonical proposal
         proposal = ActionProposal(
-            proposal_id=uuid4(),
-            episode_id=uuid4(),
-            task_node_id=uuid4(),
+            proposal_id=proposal_id or uuid4(),
+            episode_id=episode_id or uuid4(),
+            task_node_id=task_node_id or uuid4(),
             tool_id=tool_id,
             operation=operation,
             connector_id=proposal_input.get("connector_id"),
@@ -149,9 +178,12 @@ class ActionNormalizer:
             requested_by=proposal_input.get("requested_by", "model"),
             contract_hash=ledger.get("contract_hash", ""),
             ledger_hash=ledger.get("hash", ""),
-            risk_class=RiskClass(proposal_input.get("risk_class", "medium")),
-            side_effect_class=SideEffectClass(proposal_input.get("side_effect_class", "none")),
-            idempotency_key=proposal_input.get("idempotency_key", str(uuid4())),
+            risk_class=risk_class,
+            side_effect_class=side_effect_class,
+            idempotency_key=proposal_input.get("idempotency_key") or str(uuid4()),
+            principal_id=principal_id,
+            tenant_id=tenant_id,
+            rollback_strategy=rollback_strategy,
         )
 
         return proposal, None
