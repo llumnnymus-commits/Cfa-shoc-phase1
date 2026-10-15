@@ -3,7 +3,7 @@ Pytest fixtures and configuration for CFA-SHOC Phase 1 tests.
 """
 
 import pytest
-from src.storage import StorageManager
+from cfa_shoc.storage import StorageManager
 
 
 @pytest.fixture(scope="session")

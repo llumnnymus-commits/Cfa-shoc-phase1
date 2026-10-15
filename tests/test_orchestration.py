@@ -11,17 +11,17 @@ Covers:
 import pytest
 from datetime import datetime
 from uuid import uuid4
-from src.domain import (
+from cfa_shoc.domain import (
     ActionProposal, PreflightResult, RiskClass, SideEffectClass, RollbackStrategy,
     TransactionState, DispatchRequest, RawResult, ResultVerification,
 )
-from src.storage import StorageManager
-from src.state_machine import TransactionStateMachine
-from src.services import (
+from cfa_shoc.storage import StorageManager
+from cfa_shoc.state_machine import TransactionStateMachine
+from cfa_shoc.services import (
     CapabilitySnapshotService, ActionNormalizer, PreflightService, PolicyDecisionPoint,
     TransactionCoordinator, ToolAdapter, ResultVerifier, CommitMembrane, AuditLedger,
 )
-from src.orchestrator import RUN_TOOL_NODE, OrchestrationContext
+from cfa_shoc.orchestrator import RUN_TOOL_NODE, OrchestrationContext
 
 
 @pytest.fixture

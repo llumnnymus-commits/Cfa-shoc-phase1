@@ -1,22 +1,40 @@
 [build-system]
-requires = ["setuptools>=65.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "cfa-shoc"
 version = "0.1.0"
-description = "Capability-Factual, Stateful Hybrid Orchestration and Cognition - Phase 1"
+description = "A transaction layer for AI agent tool calls: preflight, policy, lease, verify, commit, audit"
+readme = "README.md"
 requires-python = ">=3.11"
-license = {text = "MIT"}
-
-dependencies = [
-    "pydantic>=2.0",
-    "sqlalchemy>=2.0",
-    "python-dateutil>=2.8",
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "llumnnymus-commits" }]
+keywords = ["ai-agents", "tool-calling", "audit", "state-machine", "governance"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
 ]
 
+dependencies = [
+    "sqlalchemy>=2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/llumnnymus-commits/Cfa-shoc-phase1"
+Issues = "https://github.com/llumnnymus-commits/Cfa-shoc-phase1/issues"
+
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-cov>=4.0", "pytest-timeout>=2.2", "black>=23.0", "ruff>=0.1", "mypy>=1.0"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "pytest-timeout>=2.2", "build>=1.0", "black>=23.0", "ruff>=0.1", "mypy>=1.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.black]
 line-length = 100

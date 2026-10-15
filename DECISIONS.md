@@ -60,3 +60,14 @@ supersedes an earlier one says so.
   input so that they test what their docstring says: `test_full_transaction_lifecycle` passes
   the `read` scope it registers on the tool, and `test_terminal_state_reached_on_success` passes
   `risk_class: low`. | D15. | Weak assertions can no longer pass on broken code.
+- **2026-10-15 | Step 7: package `cfa_shoc` in a `src/` layout; PyPI name `cfa-shoc`.**
+  `https://pypi.org/pypi/cfa-shoc/json` returned 404 on 2026-10-15 (name free). Runtime
+  dependency: `sqlalchemy` only (`pydantic`, `python-dateutil` removed, they were never
+  imported). MIT LICENSE, copyright holder `llumnnymus-commits` (the GitHub account; the owner
+  can change it). | D18. | Tests import `cfa_shoc.*`; `pytest.ini` sets `pythonpath = src`.
+- **2026-10-15 | Step 7: timezone-aware UTC everywhere.** `cfa_shoc.utcnow()` returns
+  aware UTC. Storage columns use `UTCDateTime` (store naive UTC, return aware UTC), so SQLite
+  and PostgreSQL compare UTC with UTC. | `datetime.utcnow()` is deprecated from 3.12. | The
+  suite runs with `-W error::DeprecationWarning` cleanly.
+- **2026-10-15 | Step 7: CI actions bumped to checkout@v5 / setup-python@v6.** | CI warned
+  that Node 20 actions are deprecated. | No behavior change.

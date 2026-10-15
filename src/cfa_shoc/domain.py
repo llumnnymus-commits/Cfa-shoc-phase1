@@ -6,10 +6,15 @@ and Cognition system with deterministic control shell around probabilistic propo
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 from uuid import UUID, uuid4
+
+
+def utcnow() -> datetime:
+    """Current time as a timezone-aware UTC datetime."""
+    return datetime.now(timezone.utc)
 
 
 class TransactionState(str, Enum):
@@ -94,7 +99,7 @@ class ActionProposal:
     principal_id: str = ""
     tenant_id: str = ""
     rollback_strategy: RollbackStrategy = RollbackStrategy.NONE
-    proposed_at: datetime = field(default_factory=datetime.utcnow)
+    proposed_at: datetime = field(default_factory=utcnow)
 
 
 @dataclass
@@ -119,7 +124,7 @@ class PolicyDecision:
     evidence_refs: List[str] = field(default_factory=list)
     checks: Dict[str, bool] = field(default_factory=dict)
     signature: str = ""
-    expires_at: datetime = field(default_factory=datetime.utcnow)
+    expires_at: datetime = field(default_factory=utcnow)
     approver_type: str = "system"
     approver_id: str = ""
 
@@ -133,7 +138,7 @@ class DispatchRequest:
     connector_id: Optional[str]
     arguments: Dict[str, Any]
     idempotency_key: str
-    deadline_at: datetime = field(default_factory=datetime.utcnow)
+    deadline_at: datetime = field(default_factory=utcnow)
     auth_context_ref: str = ""
     trace_context: Dict[str, str] = field(default_factory=dict)
 
@@ -146,7 +151,7 @@ class RawResult:
     headers: Dict[str, str] = field(default_factory=dict)
     body: Optional[bytes] = None
     external_operation_id: Optional[str] = None
-    received_at: datetime = field(default_factory=datetime.utcnow)
+    received_at: datetime = field(default_factory=utcnow)
     output: Any = None  # parsed tool output (JSON-compatible)
     tool_id: Optional[str] = None  # echoed by the adapter
     connector_id: Optional[str] = None  # echoed by the adapter
@@ -205,8 +210,8 @@ class ToolTransaction:
     result_envelope: Optional[Dict[str, Any]] = None
     policy_decision: Optional[Dict[str, Any]] = None
     verification: Optional[Dict[str, Any]] = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=utcnow)
+    updated_at: datetime = field(default_factory=utcnow)
     deadline_at: Optional[datetime] = None
     version: int = 0
 
@@ -224,7 +229,7 @@ class TransactionEvent:
     payload: Dict[str, Any] = field(default_factory=dict)
     prior_hash: Optional[str] = None
     event_hash: str = ""
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=utcnow)
 
 
 @dataclass
@@ -240,10 +245,10 @@ class CommitDecision:
     checks: Dict[str, bool] = field(default_factory=dict)
     decision: str = ""  # APPROVE, DENY
     signature: str = ""
-    expires_at: datetime = field(default_factory=datetime.utcnow)
+    expires_at: datetime = field(default_factory=utcnow)
     approver_type: str = "system"
     approver_id: str = ""
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=utcnow)
 
 
 @dataclass
@@ -252,8 +257,8 @@ class DispatchLease:
     transaction_id: UUID
     owner_id: str
     lease_token: str = field(default_factory=lambda: str(uuid4()))
-    acquired_at: datetime = field(default_factory=datetime.utcnow)
-    expires_at: datetime = field(default_factory=datetime.utcnow)
+    acquired_at: datetime = field(default_factory=utcnow)
+    expires_at: datetime = field(default_factory=utcnow)
 
 
 @dataclass

@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional, Tuple
 from uuid import UUID, uuid4
 
 from .domain import (
+    utcnow,
     ActionProposal, CommitDecision, CommitRequest, DispatchLease, DispatchRequest,
     ObservationEnvelope, PolicyDecision, PreflightResult, RawResult, ResultVerification,
     ToolTransaction, TransactionEvent, TransactionState,
@@ -45,7 +46,7 @@ class OrchestrationContext:
         self.requested_by = requested_by  # "model", "user", "policy", "recovery"
         # Episode contract: {"scopes": [...], "pre_authorized": [...], "max_risk": "..."}
         self.contract: Dict[str, Any] = contract if contract is not None else {}
-        self.created_at = datetime.utcnow()
+        self.created_at = utcnow()
         self.ledger_snapshot = None
         self.transaction_id = None
 
@@ -262,7 +263,7 @@ class RUN_TOOL_NODE:
 
             # Asynchronous acceptance: reconciliation finishes the transaction later
             if raw_result.transport_status == "async_accepted":
-                transaction.deadline_at = datetime.utcnow() + timedelta(hours=24)
+                transaction.deadline_at = utcnow() + timedelta(hours=24)
                 self._transition(session, transaction, "async_accepted",
                                  {"external_operation_id": transaction.external_operation_id})
                 return transaction, PreflightResult(
@@ -388,7 +389,7 @@ class RUN_TOOL_NODE:
         """Step 5: Verify policy signature and check expiry."""
         if not policy_decision.approved:
             return False
-        if policy_decision.expires_at < datetime.utcnow():
+        if policy_decision.expires_at < utcnow():
             return False
         verify = getattr(self.policy_point, "verify_signature", None)
         if verify is not None:
@@ -401,8 +402,8 @@ class RUN_TOOL_NODE:
             transaction_id=transaction.transaction_id,
             owner_id=transaction.principal_id,
             lease_token=str(uuid4()),
-            acquired_at=datetime.utcnow(),
-            expires_at=datetime.utcnow() + timedelta(minutes=5),
+            acquired_at=utcnow(),
+            expires_at=utcnow() + timedelta(minutes=5),
         )
         try:
             self.storage.acquire_lease(session, self._dl_to_dict(lease))
@@ -420,7 +421,7 @@ class RUN_TOOL_NODE:
             connector_id=transaction.connector_id,
             arguments=transaction.input_payload,
             idempotency_key=transaction.idempotency_key,
-            deadline_at=datetime.utcnow() + timedelta(minutes=5),
+            deadline_at=utcnow() + timedelta(minutes=5),
             auth_context_ref=transaction.principal_id,
         )
         return self.tool_adapter.dispatch(dispatch_request)
@@ -503,7 +504,7 @@ class RUN_TOOL_NODE:
             ))
             raise
         transaction.state = next_state
-        transaction.updated_at = datetime.utcnow()
+        transaction.updated_at = utcnow()
         self._record(
             session, transaction, event, from_state.value, next_state.value,
             {"reason": reason, **(payload or {})},

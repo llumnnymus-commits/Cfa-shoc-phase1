@@ -4,8 +4,8 @@ Unit tests for ActionNormalizer (handoff step 4: D6, D7).
 
 from uuid import uuid4
 
-from src.domain import RiskClass, RollbackStrategy, SideEffectClass
-from src.services import ActionNormalizer, CapabilitySnapshotService
+from cfa_shoc.domain import RiskClass, RollbackStrategy, SideEffectClass
+from cfa_shoc.services import ActionNormalizer, CapabilitySnapshotService
 
 
 def _normalizer():
