@@ -49,3 +49,14 @@ supersedes an earlier one says so.
   `LeaseConflictError` when an unexpired lease exists for the same transaction; the orchestrator
   maps that to `authorization_revoked`. | The test `test_concurrent_lease_acquisition_conflict`
   asserted the defect ("SQLite doesn't enforce"); it now asserts what its own docstring says.
+- **2026-10-15 | Step 6: idempotent replay.** If the same tenant + idempotency key already has
+  a COMMITTED transaction, `execute` returns that transaction (`allowed=True`, reason
+  "Idempotent replay") and does not dispatch again. REJECTED or FAILED attempts may be retried
+  with the same key. | `test_duplicate_proposal_uses_same_transaction` claimed deduplication
+  that did not exist. | Retries after a lost response are safe.
+- **2026-10-15 | Step 6: test end states.** Every "final state is PROPOSED" or "anything goes"
+  assertion now names the state the scenario must reach, taken from each test's docstring:
+  default MEDIUM risk -> REJECTED by policy; low risk -> COMMITTED. Two scenarios gained one
+  input so that they test what their docstring says: `test_full_transaction_lifecycle` passes
+  the `read` scope it registers on the tool, and `test_terminal_state_reached_on_success` passes
+  `risk_class: low`. | D15. | Weak assertions can no longer pass on broken code.

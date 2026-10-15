@@ -157,6 +157,18 @@ class RUN_TOOL_NODE:
                     checks_performed=["normalization"], failures=[error],
                 )
 
+            # Idempotent replay: same tenant + idempotency key already committed
+            committed = self.storage.find_by_idempotency_key(
+                session, context.tenant_id, action_proposal.idempotency_key,
+                states=[TransactionState.COMMITTED.value],
+            )
+            if committed:
+                replay = self._tx_from_row(committed[0])
+                return replay, PreflightResult(
+                    allowed=True,
+                    reason=f"Idempotent replay: already committed as {replay.transaction_id}",
+                )
+
             # Create durable transaction record in PROPOSED state
             transaction = self._create_transaction(action_proposal, context, ledger_snapshot)
             context.transaction_id = transaction.transaction_id
@@ -535,6 +547,37 @@ class RUN_TOOL_NODE:
         )
 
     # Serialization helpers
+
+    def _tx_from_row(self, row) -> ToolTransaction:
+        """Rebuild a ToolTransaction from its stored row."""
+        return ToolTransaction(
+            transaction_id=UUID(row.transaction_id),
+            proposal_id=UUID(row.proposal_id),
+            episode_id=UUID(row.episode_id),
+            task_node_id=UUID(row.task_node_id),
+            tool_id=row.tool_id,
+            operation=row.operation,
+            connector_id=row.connector_id,
+            principal_id=row.principal_id,
+            tenant_id=row.tenant_id,
+            ledger_hash=row.ledger_hash,
+            contract_hash=row.contract_hash,
+            input_payload=row.input_payload,
+            input_schema_hash=row.input_schema_hash,
+            idempotency_key=row.idempotency_key,
+            risk_class=row.risk_class,
+            side_effect_class=row.side_effect_class,
+            rollback_strategy=row.rollback_strategy,
+            state=TransactionState(row.state),
+            external_operation_id=row.external_operation_id,
+            result_envelope=row.result_envelope,
+            policy_decision=row.policy_decision,
+            verification=row.verification,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+            deadline_at=row.deadline_at,
+            version=row.version,
+        )
 
     def _tx_to_dict(self, tx: ToolTransaction) -> Dict[str, Any]:
         """Convert ToolTransaction to dict for storage (state is the transaction's own)."""

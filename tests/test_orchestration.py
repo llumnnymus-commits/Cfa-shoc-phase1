@@ -32,20 +32,54 @@ def storage():
     return manager
 
 
+TOOLS_USED = [
+    "tool_echo", "tool_calc", "tool_read", "tool_safe", "tool_idempotent", "tool_dangerous",
+    "tool_audit", "tool_context", "tool_dedup", "tool_seq", "tool_terminal",
+]
+
+
 @pytest.fixture
 def services(storage):
-    """Create all services for orchestration."""
+    """Create all services for orchestration, sharing one capability service."""
+    capability = CapabilitySnapshotService()
+    capability.update_tool_state("tool_echo", {"id": "tool_echo"})
+
+    adapter = ToolAdapter()
+    adapter.calls = []
+
+    def echo(request):
+        adapter.calls.append(request)
+        return {"status": "succeeded", "output": {"tool": request.tool_id, "args": request.arguments}}
+
+    def failing(request):
+        adapter.calls.append(request)
+        raise ConnectionError("connector down")
+
+    for tool_id in TOOLS_USED:
+        adapter.register(tool_id, echo)
+    adapter.register("tool_failing", failing)
+
     return {
-        "capability": CapabilitySnapshotService(),
-        "normalizer": ActionNormalizer(),
-        "preflight": PreflightService(),
+        "capability": capability,
+        "normalizer": ActionNormalizer(capability),
+        "preflight": PreflightService(capability),
         "policy": PolicyDecisionPoint(),
         "coordinator": TransactionCoordinator(),
-        "adapter": ToolAdapter(),
+        "adapter": adapter,
         "verifier": ResultVerifier(),
         "commit": CommitMembrane(),
         "audit": AuditLedger(),
     }
+
+
+def stored_events(orchestrator, transaction):
+    """Event types stored for a transaction, in order."""
+    session = orchestrator.storage.get_session()
+    try:
+        events = orchestrator.storage.get_events_for_transaction(session, str(transaction.transaction_id))
+        return [e.event_type for e in events]
+    finally:
+        session.close()
 
 
 @pytest.fixture
@@ -83,6 +117,7 @@ class TestOrchestrationSuccess:
             principal_id="user_123",
             tenant_id="tenant_456",
             requested_by="user",
+            contract={"scopes": ["read"]},  # tool_echo requires the "read" scope
         )
 
         model_proposal = {
@@ -97,7 +132,12 @@ class TestOrchestrationSuccess:
         transaction, result = orchestrator.execute(model_proposal, context)
 
         # Verify transaction state
-        assert transaction.state == TransactionState.PROPOSED
+        assert result.allowed, result.reason
+        assert transaction.state == TransactionState.COMMITTED
+        assert stored_events(orchestrator, transaction) == [
+            "orchestration_started", "preflight_passed", "policy_approved", "dispatch_started",
+            "response_received", "verification_passed", "action_commit_approved",
+        ]
         assert transaction.tool_id == "tool_echo"
         assert transaction.operation == "echo"
         assert transaction.principal_id == "user_123"
@@ -129,6 +169,7 @@ class TestOrchestrationSuccess:
         assert transaction.tool_id == "tool_calc"
         assert transaction.operation == "add"
         assert transaction.input_payload["a"] == 5
+        assert transaction.state == TransactionState.COMMITTED
 
     def test_preflight_checks_pass(self, orchestrator, services):
         """Preflight validation passes for valid proposal."""
@@ -160,8 +201,10 @@ class TestOrchestrationSuccess:
         }
 
         transaction, result = orchestrator.execute(model_proposal, context)
-        # Transaction should at least reach PREFLIGHTED state or later
-        assert transaction.state != TransactionState.REJECTED or result.allowed == False
+        # Healthy connector, registered tool, low risk: passes preflight and commits
+        assert result.allowed, result.reason
+        assert "preflight_passed" in stored_events(orchestrator, transaction)
+        assert transaction.state == TransactionState.COMMITTED
 
     def test_policy_decision_framework(self, orchestrator, services):
         """Policy decision point evaluates proposals."""
@@ -185,8 +228,10 @@ class TestOrchestrationSuccess:
         }
 
         transaction, result = orchestrator.execute(model_proposal, context)
-        # Policy point should have evaluated the proposal
+        # Policy point evaluated the proposal: low risk + reversible is approved (lane A)
         assert transaction.tool_id == "tool_safe"
+        assert transaction.policy_decision["approved"] is True
+        assert transaction.state == TransactionState.COMMITTED
 
     def test_idempotency_key_preservation(self, orchestrator, services):
         """Idempotency key is preserved through transaction."""
@@ -213,6 +258,14 @@ class TestOrchestrationSuccess:
 
         transaction, result = orchestrator.execute(model_proposal, context)
         assert transaction.idempotency_key == idempotency_key
+        # No risk_class given: default MEDIUM is denied by policy
+        assert transaction.state == TransactionState.REJECTED
+        session = orchestrator.storage.get_session()
+        try:
+            row = orchestrator.storage.get_transaction(session, str(transaction.transaction_id))
+            assert row.idempotency_key == idempotency_key
+        finally:
+            session.close()
 
 
 class TestOrchestrationFailures:
@@ -237,8 +290,11 @@ class TestOrchestrationFailures:
         }
 
         transaction, result = orchestrator.execute(model_proposal, context)
-        # Should fail preflight or be rejected
-        assert not result.allowed or transaction.state == TransactionState.PROPOSED
+        # Refused before authorization: never dispatched
+        assert not result.allowed
+        assert transaction.state == TransactionState.REJECTED
+        assert "policy_approved" not in stored_events(orchestrator, transaction)
+        assert services["adapter"].calls == []
 
     def test_policy_denial_rejects_transaction(self, orchestrator, services):
         """Policy denial transitions to REJECTED state."""
@@ -265,8 +321,10 @@ class TestOrchestrationFailures:
         }
 
         transaction, result = orchestrator.execute(model_proposal, context)
-        # Policy point should deny critical operations by default
-        assert transaction.state in [TransactionState.PROPOSED, TransactionState.REJECTED]
+        # Policy point denies critical operations by default
+        assert transaction.state == TransactionState.REJECTED
+        assert stored_events(orchestrator, transaction)[-1] == "policy_denied"
+        assert services["adapter"].calls == []
 
     def test_dispatch_failure_on_connector_error(self, orchestrator, services):
         """Tool dispatch failure is handled gracefully."""
@@ -295,8 +353,25 @@ class TestOrchestrationFailures:
         }
 
         transaction, result = orchestrator.execute(model_proposal, context)
-        # Should handle connector failure
+        # The unhealthy connector is caught at preflight, before any dispatch
         assert transaction.tool_id == "tool_failing"
+        assert not result.allowed
+        assert transaction.state == TransactionState.REJECTED
+        assert "not healthy" in result.reason
+        assert services["adapter"].calls == []
+
+        # With a healthy connector the dispatch itself fails: FAILED
+        services["capability"].current_snapshot["connectors"]["failing_connector"]["health"] = "healthy"
+        context2 = OrchestrationContext(
+            proposal_id=uuid4(), episode_id=uuid4(), task_node_id=uuid4(),
+            principal_id="user_123", tenant_id="tenant_456", requested_by="user",
+        )
+        transaction2, result2 = orchestrator.execute(
+            {**model_proposal, "risk_class": "low", "idempotency_key": "fail-2"}, context2
+        )
+        assert not result2.allowed
+        assert transaction2.state == TransactionState.FAILED
+        assert stored_events(orchestrator, transaction2)[-1] == "connector_error"
 
     def test_no_direct_proposed_to_committed(self, orchestrator):
         """Constraint: Cannot jump directly from PROPOSED to COMMITTED."""
@@ -337,9 +412,15 @@ class TestAuditAndObservability:
         try:
             tx_record = orchestrator.storage.get_transaction(session, str(transaction.transaction_id))
             assert tx_record is not None
-            assert tx_record.state == TransactionState.PROPOSED.value
+            # Default MEDIUM risk is denied; the stored state matches
+            assert tx_record.state == TransactionState.REJECTED.value
+            assert tx_record.state == transaction.state.value
         finally:
             session.close()
+        # One event per transition, in order
+        assert stored_events(orchestrator, transaction) == [
+            "orchestration_started", "preflight_passed", "policy_denied",
+        ]
 
     def test_transaction_context_preserved(self, orchestrator, services):
         """Orchestration context preserved through execution."""
@@ -400,10 +481,12 @@ class TestConcurrency:
             "operation": "op",
             "arguments": {},
             "idempotency_key": idempotency_key,
+            "risk_class": "low",
         }
 
         transaction1, result1 = orchestrator.execute(model_proposal, context1)
         assert transaction1.idempotency_key == idempotency_key
+        assert transaction1.state == TransactionState.COMMITTED
 
         # Second execution with same idempotency key should be handled by lease logic
         context2 = OrchestrationContext(
@@ -416,8 +499,12 @@ class TestConcurrency:
         )
 
         transaction2, result2 = orchestrator.execute(model_proposal, context2)
-        # Second should also complete (or be handled by lease conflict)
+        # Second is an idempotent replay: same transaction, no second dispatch
         assert transaction2.idempotency_key == idempotency_key
+        assert transaction2.transaction_id == transaction1.transaction_id
+        assert transaction2.state == TransactionState.COMMITTED
+        assert result2.allowed and "Idempotent replay" in result2.reason
+        assert len(services["adapter"].calls) == 1
 
 
 class TestStateTransitionSequence:
@@ -446,8 +533,19 @@ class TestStateTransitionSequence:
 
         transaction, result = orchestrator.execute(model_proposal, context)
 
-        # Verify we start in PROPOSED (orchestrator creates in PROPOSED)
-        assert transaction.state == TransactionState.PROPOSED
+        # Starts in PROPOSED, then PREFLIGHTED, then AUTHORIZED, then onward to COMMITTED
+        session = orchestrator.storage.get_session()
+        try:
+            events = orchestrator.storage.get_events_for_transaction(session, str(transaction.transaction_id))
+            path = [(e.from_state, e.to_state) for e in events]
+        finally:
+            session.close()
+        assert path[:3] == [
+            (None, "PROPOSED"),
+            ("PROPOSED", "PREFLIGHTED"),
+            ("PREFLIGHTED", "AUTHORIZED"),
+        ]
+        assert transaction.state == TransactionState.COMMITTED
 
     def test_terminal_state_reached_on_success(self, orchestrator, services):
         """Successful execution reaches terminal state (COMMITTED or equivalent)."""
@@ -468,9 +566,11 @@ class TestStateTransitionSequence:
             "tool_id": "tool_terminal",
             "operation": "op",
             "arguments": {},
+            "risk_class": "low",  # successful execution requires an approvable proposal
         }
 
         transaction, result = orchestrator.execute(model_proposal, context)
 
-        # State should be a valid transaction state
-        assert isinstance(transaction.state, TransactionState)
+        # Successful execution ends COMMITTED, which is terminal
+        assert transaction.state == TransactionState.COMMITTED
+        assert TransactionStateMachine.is_terminal(transaction.state)

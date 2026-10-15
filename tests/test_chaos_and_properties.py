@@ -245,15 +245,14 @@ class TestPropertyInvariants:
 
     def test_property_no_unregistered_tool_dispatch(self):
         """Property: Tool must be in capability snapshot to dispatch."""
-        from src.services import PreflightService
+        from src.services import CapabilitySnapshotService, PreflightService
+        from src.domain import ActionProposal
 
-        preflight = PreflightService()
+        capability = CapabilitySnapshotService()
+        preflight = PreflightService(capability)
 
-        # Create transaction requesting unregistered tool
-        from src.domain import ToolTransaction
-
-        tx = ToolTransaction(
-            transaction_id=uuid4(),
+        # Proposal requesting an unregistered tool
+        proposal = ActionProposal(
             proposal_id=uuid4(),
             episode_id=uuid4(),
             task_node_id=uuid4(),
@@ -263,19 +262,14 @@ class TestPropertyInvariants:
             tenant_id="tenant_1",
         )
 
-        # Snapshot without the tool
-        snapshot = {
-            "tools": {},  # Tool not available
-            "connectors": {},
-            "models": {},
-            "skills": {},
-            "quotas": {},
-            "policies": {},
-        }
+        # Current snapshot (valid ledger) without the tool
+        snapshot = capability.refresh_snapshot("user_1", "tenant_1")
+        assert "unregistered_tool" not in snapshot["tools"]
 
-        # Preflight should reject
-        result = preflight.check(tx, snapshot)
+        # Preflight should reject, and say why
+        result = preflight.check(proposal, snapshot, {})
         assert not result.allowed
+        assert any("not available" in failure for failure in result.failures)
 
     def test_property_no_double_dispatch(self):
         """Property: A transaction cannot be dispatched twice (idempotency lock)."""
