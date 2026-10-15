@@ -31,8 +31,8 @@ commit gate, with a hash-chained audit log.
 | 8 real checks | f7368f4 | https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38725147586 | **green** |
 | 9 audit + reconcile | e4b0f7e | https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38725647866 | **green** |
 | 10 baton | bcdeb91 | https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38725981928 | **green** |
-| 11 provenance | 4be475c | https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38726301961 | see next update |
-| 12 demo + docs | (this commit) | see next update | demo job added |
+| 11 provenance | 4be475c | https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38726301961 | **green** (package job ran `cfa-shoc --version`) |
+| 12 demo + docs | 73415c7 | https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38726669036 | **green**: tests x3, package, demo (log ends `DEMO OK`) |
 
 ## Known defects
 D1 to D19 from `HANDOFF_FOR_CLAUDE_CODE.md` section 4 are fixed (steps 1 to 12). Known limits
