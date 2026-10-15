@@ -18,12 +18,13 @@ class TransactionStateMachine:
     """
     Enforces legal state transitions per Phase 1 specification section 3.2.
 
-    Legal transition table:
+    Legal transition table (24 transitions):
     - PROPOSED + preflight_passed -> PREFLIGHTED
     - PROPOSED + preflight_failed -> REJECTED
     - PREFLIGHTED + policy_approved -> AUTHORIZED
     - PREFLIGHTED + policy_denied -> REJECTED
     - AUTHORIZED + dispatch_started -> DISPATCHED
+    - AUTHORIZED + authorization_revoked -> REJECTED
     - DISPATCHED + response_received -> RETURNED
     - DISPATCHED + async_accepted -> PENDING_EXTERNAL
     - DISPATCHED + deadline_exceeded -> UNKNOWN
@@ -34,12 +35,19 @@ class TransactionStateMachine:
     - PENDING_EXTERNAL + status_failed -> FAILED
     - PENDING_EXTERNAL + status_unknown -> UNKNOWN
     - VERIFIED + action_commit_approved -> COMMITTED
-    - VERIFIED + action_commit_denied -> COMMIT_REJECTED
+    - VERIFIED + action_commit_denied -> REJECTED
     - UNKNOWN + reconcile_succeeded -> VERIFIED
     - UNKNOWN + reconcile_failed -> FAILED
     - UNKNOWN + compensation_required -> COMPENSATION_REQUIRED
     - COMMITTED + compensation_succeeded -> COMPENSATED
+    - COMPENSATION_REQUIRED + compensation_succeeded -> COMPENSATED
+    - COMPENSATION_REQUIRED + compensation_failed -> COMPENSATION_FAILED
+    - COMMITTED + compensation_succeeded -> COMPENSATED
     - COMMITTED + compensation_failed -> COMPENSATION_FAILED
+
+    TERMINAL_STATES: no further forward processing. COMMITTED is terminal but may still be
+    compensated afterwards (only the two compensation events).
+    FINAL_STATES: terminal states with no outgoing transitions at all.
     """
 
     # Define legal transitions as (current_state, event) -> next_state
@@ -49,6 +57,7 @@ class TransactionStateMachine:
         (TransactionState.PREFLIGHTED, "policy_approved"): TransactionState.AUTHORIZED,
         (TransactionState.PREFLIGHTED, "policy_denied"): TransactionState.REJECTED,
         (TransactionState.AUTHORIZED, "dispatch_started"): TransactionState.DISPATCHED,
+        (TransactionState.AUTHORIZED, "authorization_revoked"): TransactionState.REJECTED,
         (TransactionState.DISPATCHED, "response_received"): TransactionState.RETURNED,
         (TransactionState.DISPATCHED, "async_accepted"): TransactionState.PENDING_EXTERNAL,
         (TransactionState.DISPATCHED, "deadline_exceeded"): TransactionState.UNKNOWN,
@@ -63,11 +72,13 @@ class TransactionStateMachine:
         (TransactionState.UNKNOWN, "reconcile_succeeded"): TransactionState.VERIFIED,
         (TransactionState.UNKNOWN, "reconcile_failed"): TransactionState.FAILED,
         (TransactionState.UNKNOWN, "compensation_required"): TransactionState.COMPENSATION_REQUIRED,
+        (TransactionState.COMPENSATION_REQUIRED, "compensation_succeeded"): TransactionState.COMPENSATED,
+        (TransactionState.COMPENSATION_REQUIRED, "compensation_failed"): TransactionState.COMPENSATION_FAILED,
         (TransactionState.COMMITTED, "compensation_succeeded"): TransactionState.COMPENSATED,
         (TransactionState.COMMITTED, "compensation_failed"): TransactionState.COMPENSATION_FAILED,
     }
 
-    # Terminal states - no further transitions allowed
+    # Terminal states - no further forward processing (COMMITTED may still be compensated)
     TERMINAL_STATES = {
         TransactionState.COMMITTED,
         TransactionState.COMPENSATED,
@@ -75,6 +86,12 @@ class TransactionStateMachine:
         TransactionState.FAILED,
         TransactionState.REJECTED,
     }
+
+    # Final states - terminal states with zero outgoing transitions
+    FINAL_STATES = TERMINAL_STATES - {TransactionState.COMMITTED}
+
+    # Events allowed out of COMMITTED (compensation only)
+    POST_COMMIT_EVENTS = {"compensation_succeeded", "compensation_failed"}
 
     # Constraint: no direct jump from PROPOSED to COMMITTED
     PROHIBITED_PATHS = {
@@ -126,6 +143,11 @@ class TransactionStateMachine:
     def is_terminal(cls, state: TransactionState) -> bool:
         """Check if state is terminal."""
         return state in cls.TERMINAL_STATES
+
+    @classmethod
+    def is_final(cls, state: TransactionState) -> bool:
+        """Check if state is final (terminal with no outgoing transitions)."""
+        return state in cls.FINAL_STATES
 
     @classmethod
     def get_possible_transitions(cls, current: TransactionState) -> Set[Tuple[str, TransactionState]]:

@@ -151,22 +151,28 @@ class TestChaosScenarios:
             TransactionStateMachine.transition(TransactionState.COMMITTED, "any_event")
 
     def test_terminal_state_prevents_further_transitions(self):
-        """Terminal states refuse all further transitions."""
-        terminal_states = [
-            TransactionState.COMMITTED,
+        """Final states refuse all transitions; COMMITTED allows only compensation."""
+        final_states = [
             TransactionState.FAILED,
             TransactionState.REJECTED,
             TransactionState.COMPENSATED,
             TransactionState.COMPENSATION_FAILED,
         ]
+        assert set(final_states) == TransactionStateMachine.FINAL_STATES
 
-        for state in terminal_states:
-            # Check that state is terminal
+        for state in final_states:
+            # Final states are terminal
             assert TransactionStateMachine.is_terminal(state)
 
-            # No transitions should be possible from terminal states
+            # No transitions should be possible from final states
             transitions = TransactionStateMachine.get_possible_transitions(state)
-            assert len(transitions) == 0, f"Terminal state {state} has possible transitions: {transitions}"
+            assert len(transitions) == 0, f"Final state {state} has possible transitions: {transitions}"
+
+        # COMMITTED is terminal (no forward processing) but can still be compensated
+        assert TransactionStateMachine.is_terminal(TransactionState.COMMITTED)
+        assert not TransactionStateMachine.is_final(TransactionState.COMMITTED)
+        events = {e for e, _ in TransactionStateMachine.get_possible_transitions(TransactionState.COMMITTED)}
+        assert events == {"compensation_succeeded", "compensation_failed"}
 
     def test_event_append_only_preservation(self):
         """Append-only event ledger cannot be modified or reordered."""
