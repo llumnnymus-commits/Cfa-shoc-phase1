@@ -56,6 +56,13 @@ jobs:
           cd /tmp
           /tmp/fresh/bin/python -c "import cfa_shoc; print(cfa_shoc.__version__); assert cfa_shoc.__version__ == '0.1.0'"
 
+      - name: Install the provenance extra and run the console script
+        run: |
+          WHEEL=$(ls dist/*.whl)
+          /tmp/fresh/bin/pip install "${WHEEL}[provenance]"
+          cd /tmp
+          /tmp/fresh/bin/cfa-shoc --version
+
   # Enable in HANDOFF step 12 once examples/demo_echo.py exists.
   # demo:
   #   runs-on: ubuntu-latest

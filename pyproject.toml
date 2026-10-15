@@ -26,12 +26,16 @@ dependencies = [
     "sqlalchemy>=2.0",
 ]
 
+[project.scripts]
+cfa-shoc = "cfa_shoc.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/llumnnymus-commits/Cfa-shoc-phase1"
 Issues = "https://github.com/llumnnymus-commits/Cfa-shoc-phase1/issues"
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-cov>=4.0", "pytest-timeout>=2.2", "build>=1.0", "black>=23.0", "ruff>=0.1", "mypy>=1.0"]
+provenance = ["cryptography>=42"]
+dev = ["cryptography>=42", "pytest>=7.0", "pytest-cov>=4.0", "pytest-timeout>=2.2", "build>=1.0", "black>=23.0", "ruff>=0.1", "mypy>=1.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
