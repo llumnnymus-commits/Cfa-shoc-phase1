@@ -360,7 +360,7 @@ an owner question before it goes live.
 
 | Step | State | Evidence (CI run URL / commit) |
 |---|---|---|
-| 0 Place and verify | pending | |
+| 0 Place and verify | done | unpack ALL 24 FILES OK; 18/18 hashes match; commit 3d478cb |
 | 1 CI baseline | pending | |
 | 2 Fix D1 | pending (fix proven in sandbox: 33/33) | |
 | 3 State machine | pending | |
