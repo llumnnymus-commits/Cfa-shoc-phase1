@@ -371,9 +371,9 @@ an owner question before it goes live.
 | 8 Real checks | done | CI green: https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38725147586 (commit f7368f4) |
 | 9 Audit and reconcile | done | CI green: https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38725647866 (commit e4b0f7e) |
 | 10 Baton | done | spec tests 1-9 pass; CI green: https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38725981928 (commit bcdeb91) |
-| 11 Provenance | done | spec tests 1-7 pass in session (211 total on 3 Pythons); CI run https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38726301961 (commit 4be475c) |
-| 12 Demo and docs | done (CI pending) | demo prints DEMO OK in session; 214 passed on 3 Pythons; see PROJECT_STATE_VERIFIED.md for the run |
-| 13 Release | pending (owner question) | |
+| 11 Provenance | done | spec tests 1-7 pass; CI green: https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38726301961 (commit 4be475c) |
+| 12 Demo and docs | done | CI green incl. demo job printing DEMO OK: https://github.com/llumnnymus-commits/Cfa-shoc-phase1/actions/runs/38726669036 (commit 73415c7) |
+| 13 Release | waiting for the owner's answer (asked 2026-10-15) | |
 | 14 Sales assets | pending (owner question per listing) | |
 
 **Next action:** Step 13 owner question (public repo + MIT + PyPI release), asked once with the recommended default.
