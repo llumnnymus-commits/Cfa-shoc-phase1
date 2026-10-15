@@ -91,6 +91,9 @@ class ActionProposal:
     risk_class: RiskClass = RiskClass.MEDIUM
     side_effect_class: SideEffectClass = SideEffectClass.NONE
     idempotency_key: str = ""
+    principal_id: str = ""
+    tenant_id: str = ""
+    rollback_strategy: RollbackStrategy = RollbackStrategy.NONE
     proposed_at: datetime = field(default_factory=datetime.utcnow)
 
 
