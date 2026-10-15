@@ -119,3 +119,14 @@ supersedes an earlier one says so.
   per-tool compensator; without one a human must act. A DISPATCHED transaction with no live
   lease (dead dispatcher) -> UNKNOWN. | Reuses the one transition/commit path instead of a
   second implementation. | The old `reconcile(tx)` query method is kept.
+- **2026-10-15 | Step 10: DRxit baton design choices** (spec gaps). Baton id = SHA-256 of the
+  canonical baton without `signature`; successors cite it as `parent_baton_hash`. `seal`
+  validates content (structure, evidence, contradictions, legs/parent, transactions, rollback,
+  evaluation) and refuses with `BatonRejected` before anything is stored. `validate` adds the
+  signature, registry (`{capability: [authorities]}`, checks 3-4) and artifact checks and
+  records the outcome on the stored baton: failure -> REJECTED (fail closed). `acknowledge`
+  (no key) only accepts a SEALED baton whose last validation passed and whose content still
+  hashes to its id. "Final state" for cited transactions means terminal (COMMITTED counts).
+  Unknown fields are rejected, which keeps raw hidden reasoning out (rule 5). Signing is
+  HMAC-SHA256 until provenance (Ed25519) lands. | The spec leaves these open. | Recorded in
+  `cfa_shoc/baton.py` docstrings.

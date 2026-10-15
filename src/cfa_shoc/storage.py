@@ -175,6 +175,28 @@ class PolicyDecisionORM(Base):
     )
 
 
+class BatonORM(Base):
+    """ORM model for sealed DRxit batons (see cfa_shoc.baton)."""
+    __tablename__ = "batons"
+
+    baton_hash = Column(String(64), primary_key=True)  # sha256 of the unsigned baton
+    run_id = Column(String(255), nullable=False)
+    leg = Column(Integer, nullable=False)
+    parent_baton_hash = Column(String(64))
+    content = Column(JSON, nullable=False)  # the full baton including its signature
+    state = Column(String(20), nullable=False)  # SEALED, ACKNOWLEDGED, RETIRED, REJECTED
+    validated = Column(Integer, nullable=False, default=0)  # last validate() passed
+    errors = Column(JSON)
+    successor_id = Column(String(255))
+    created_at = Column(UTCDateTime, nullable=False, default=utcnow)
+    acknowledged_at = Column(UTCDateTime)
+    retired_at = Column(UTCDateTime)
+
+    __table_args__ = (
+        Index("ux_baton_run_leg", "run_id", "leg", unique=True),
+    )
+
+
 class StorageManager:
     """Manages database connections and operations."""
 
